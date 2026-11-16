@@ -1,0 +1,14 @@
+# Build outputs and local diagnostics
+*.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.log
+*.png
+*.zip
+__pycache__/
+build/
+dist/
+.vs/
