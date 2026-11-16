@@ -10,7 +10,7 @@ for forbidden in ['GetProcAddress', 'BetterINQ_', 'ApplyFood', 'ApplyEquip', 'Ap
                   'item_store', 'food_enable', 'use_biq', 'XInput']:
     assert forbidden not in s, forbidden
 keys = re.findall(r'IniGet\(ini, "auto_quest_start", "([a-z_]+)"', s)
-assert keys == ['enabled', 'save_slot', 'quest_id'], keys
+assert keys == ['enabled', 'title_only', 'title_screen_only', 'title_only_hub', 'rehook_on_return', 'save_slot', 'quest_id'], keys
 for required in ['0x25E0D7', '0x1E7E890', '0x25FF03', '0x25FF0D', '0x25FF17',
                  '0x25FD83', '0x18D7130', '0x1B8F190', '0x261180', '0x22AD900',
                  'savedLobbyUi[0x258]', '0x18CA820', '0x0620C30', '0x1B0F5A0',
@@ -24,4 +24,7 @@ assert worker.index('if (!g_cfg.enabled) return 0;') < worker.index('InstallHook
 rows = list(csv.reader((ROOT / 'quest_ids.csv').open(encoding='utf-8-sig', newline='')))
 assert len(rows) == 513
 assert len({row[0] for row in rows[1:]}) == 512
-print('PASS: three public settings, retained native startup calls, no obsolete bridge/loadout code, 512 quest IDs.')
+patches = s[s.index('bool PatchAll('):s.index('void ApplyReturnTitlePolicy() {')]
+assert patches.index('cfg.title_screen_only') < patches.index('kDlcInitCall')
+assert patches.index('if (cfg.title_only_hub) return true;') < patches.index('kOnePhaseJump')
+print('PASS: six public settings plus legacy alias, title/hub patch boundaries, native startup calls, 512 quest IDs.')

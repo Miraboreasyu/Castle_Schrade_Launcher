@@ -16,9 +16,20 @@ constexpr uintptr_t kOnePhaseJump = 0x25FF03;
 constexpr uintptr_t kQuestId1 = 0x25FF0D;
 constexpr uintptr_t kQuestId2 = 0x25FF17;
 constexpr uintptr_t kTitleStage = 0x25E0D7;
+constexpr uintptr_t kLogoExecute = 0x24C740;
+constexpr unsigned char kLogoExecuteExpected[] = {
+    0x4C, 0x8B, 0xDC,             // mov r11,rsp
+    0x56,                         // push rsi
+    0x48, 0x81, 0xEC, 0xA0, 0, 0, 0, // sub rsp,0xA0
+};
 constexpr uintptr_t kDlcInitCall = 0x25FD83;
 constexpr uintptr_t kPSave = 0x5013950;
 constexpr uintptr_t kPNet = 0x51C46B8;
+constexpr uintptr_t kPArea = 0x51C42B8;
+constexpr uintptr_t kHubDestinationTable = 0x30AC950;
+constexpr uintptr_t kSaveStartAreaPreference = 0x2691A4;
+constexpr uintptr_t kSavePreviousArea = 0x269150;
+constexpr uintptr_t kPendingArea = 0xD344;
 constexpr uint64_t kSaveSlotSize = 0x26CC00;
 constexpr unsigned char kOnePhaseExpected[] = {0x75, 0x18};
 constexpr unsigned char kOnePhasePatched[] = {0x90, 0x90};
@@ -37,16 +48,23 @@ constexpr unsigned char kLogoStartExpected[] = {
 
 struct Config {
     bool enabled = true;
+    bool title_screen_only = false;
+    bool title_only_hub = false;
+    bool rehook_on_return = true;
     int save_slot = 0;
     int quest_id = 66845;
 };
 Config g_cfg;
 uintptr_t g_exeBase = 0;
 bool g_titleHookInstalled = false;
+bool g_logoExecuteHookInstalled = false;
+bool g_startupLogoDone = false;
 bool g_dlcEnumerated = false;
 bool g_dlcTried = false;
 bool g_titleContinued = false;
 uint64_t g_titleFirstSeen = 0;
+bool g_returnTitlePolicyApplied = false;
+bool g_returnTitleRestoreWarning = false;
 
 void LogLine(const char* fmt, ...) {
     char path[MAX_PATH]{};
@@ -61,6 +79,7 @@ void LogLine(const char* fmt, ...) {
     if (fopen_s(&f, path, "a") == 0 && f) {
         va_list ap;
         va_start(ap, fmt);
+        fprintf(f, "[%llu ms] ", static_cast<unsigned long long>(GetTickCount64()));
         vfprintf(f, fmt, ap);
         va_end(ap);
         fputc('\n', f);
@@ -132,6 +151,11 @@ Config LoadConfig() {
     const std::string ini = DllDir() + "\\auto_quest_start.ini";
     c.enabled = IniGet(ini, "auto_quest_start", "enabled", 1) != 0;
     if (!c.enabled) return c;
+    // Old INIs keep their title-screen-only behavior unless the new key is set.
+    const int legacyTitleOnly = IniGet(ini, "auto_quest_start", "title_only", 0);
+    c.title_screen_only = IniGet(ini, "auto_quest_start", "title_screen_only", legacyTitleOnly) != 0;
+    c.title_only_hub = IniGet(ini, "auto_quest_start", "title_only_hub", 0) != 0;
+    c.rehook_on_return = IniGet(ini, "auto_quest_start", "rehook_on_return", 1) != 0;
     c.save_slot = IniGet(ini, "auto_quest_start", "save_slot", 0);
     c.quest_id = IniGet(ini, "auto_quest_start", "quest_id", 66845);
     if (c.save_slot < 0 || c.save_slot > 2) {
@@ -142,7 +166,9 @@ Config LoadConfig() {
         LogLine("config: invalid quest_id=%d; using 66845", c.quest_id);
         c.quest_id = 66845;
     }
-    LogLine("config: enabled=1 save_slot=%d quest_id=%d", c.save_slot, c.quest_id);
+    LogLine("config: enabled=1 title_screen_only=%u title_only_hub=%u rehook_on_return=%u save_slot=%d quest_id=%d",
+            c.title_screen_only ? 1u : 0u, c.title_only_hub ? 1u : 0u,
+            c.rehook_on_return ? 1u : 0u, c.save_slot, c.quest_id);
     return c;
 }
 
@@ -173,13 +199,155 @@ bool Wr32(uintptr_t a, uint32_t v) {
     return true;
 }
 
+void ApplySavedHubDestination() {
+    if (!g_cfg.title_only_hub) return;
+    const uintptr_t user = P(g_exeBase + kPSave);
+    const uintptr_t area = P(g_exeBase + kPArea);
+    if (!user || !area) return;
+    const uintptr_t save = reinterpret_cast<uintptr_t (*)(uintptr_t)>(
+        g_exeBase + 0x1B8DBB0)(user);
+    if (!save || !Readable(save + kSaveStartAreaPreference, 4)) return;
+    const uint32_t preference = Rd32(save + kSaveStartAreaPreference);
+    // Mirror native menu FUN_140ACC140, which we bypass when creating a hub.
+    // Six entries: previous area, then five explicit destinations. Entry zero
+    // maps to zero so aTitle retains its saved-area fallback. Do not edit the
+    // save or bypass aTitle's progression and destination checks.
+    if (preference >= 6) {
+        LogLine("hub-area: invalid saved preference=%u; retaining native destination", preference);
+        return;
+    }
+    const uintptr_t entry = g_exeBase + kHubDestinationTable + preference * 12;
+    if (!Readable(entry, 4)) return;
+    const uint32_t destination = Rd32(entry);
+    if (Wr32(area + kPendingArea, destination)) {
+        LogLine("hub-area: saved preference=%u pending=0x%X previous=0x%X",
+                preference, destination, Rd32(save + kSavePreviousArea));
+    }
+}
+
+// Only shorten a positive finite transition timer. Leave state writes, fade
+// callbacks and asynchronous readiness checks to the original update function.
+void ClearTransitionWait(uintptr_t timer, const char* phase) {
+    if (!Readable(timer, sizeof(float))) return;
+    float seconds = 0;
+    memcpy(&seconds, reinterpret_cast<const void*>(timer), sizeof(seconds));
+    if (!(seconds > 0.0f && seconds <= 10.0f)) return;
+    if (Wr32(timer, 0)) LogLine("timer-skip: %s removed %.3f s", phase, seconds);
+}
+
+// Save-operation +38 is a 30-second error timeout: NEVER change it.
+// +3C is a separate minimum display timer. Only shorten it after native
+// completion polling has advanced to the result phase and I/O succeeded.
+void ClearCompletedSaveWait(uintptr_t operation, const char* phase) {
+    if (!Readable(operation, 0x40)) return;
+    const uint32_t kind = Rd32(operation + 8);
+    bool atResult = false;
+    if (kind == 0 || kind == 6) atResult = Rd32(operation + 0x24) == 2;
+    else if (kind == 1) atResult = Rd32(operation + 0x28) == 2;
+    else if (kind == 2) atResult = Rd32(operation + 0x2C) == 2;
+    else if (kind == 3 || kind == 4) atResult = Rd32(operation + 0x30) == 6;
+    if (!atResult) return; // operation 5 has multiple phases; not covered here
+    const uintptr_t user = P(g_exeBase + kPSave);
+    if (!user || !Readable(user + 0x1F8D0, 8) ||
+        Rd32(user + 0x1F8D0) == 1 || Rd32(user + 0x1F8D4) != 1) return;
+    ClearTransitionWait(operation + 0x3C, phase);
+}
+
+void PollTitlePrefetch();
+void HandleTitleReturnPrepare(uintptr_t title);
+void ApplyReturnTitlePolicy();
+#include "startup_profile.h"
+#include "startup_prefetch.h"
+#include "startup_scene_skip.h"
+#include "startup_credits_trim.h"
+
+void OnLogoExecute(hook::Ctx* c) {
+    if (!g_cfg.enabled || g_startupLogoDone) return;
+    const uintptr_t logo = static_cast<uintptr_t>(c->rcx);
+    if (!logo || !Readable(logo + 0x50, 4)) return;
+    const uint32_t state = Rd32(logo + 0x50);
+    if (!g_cfg.title_screen_only) {
+        if (state == 0x16) StopTitlePrefetchAttempts();
+        else StartTitlePrefetch();
+        PollTitlePrefetch();
+    }
+    if (state == 0x16) {
+        ProfileStage(2, "font-prepare", Rd32(logo + 0xA0));
+        if (Rd32(logo + 0xA0) >= 1) ProfileTicket(2, "font", Rd32(logo + 0x4C));
+    }
+    static uint32_t previous = ~0u;
+    if (state != previous) {
+        previous = state;
+        LogLine("boot-trace: aLogo state=0x%X", state);
+    }
+    if (state == 0x17)
+        ClearTransitionWait(logo + 0x1C8, "aLogo transition");
+    // Only inspect the operation while its owning aLogo case is polling it.
+    const bool polling = (state == 5 && (Rd32(logo + 0x58) == 5 || Rd32(logo + 0x58) == 8)) ||
+        (state == 6 && Rd32(logo + 0x5C) == 2) ||
+        (state == 7 && Rd32(logo + 0x60) == 2) ||
+        (state == 8 && (Rd32(logo + 0x64) == 2 || Rd32(logo + 0x64) == 6)) ||
+        (state == 0x14 && Rd32(logo + 0x98) == 1);
+    if (polling) ClearCompletedSaveWait(logo + 0xA8, "aLogo completed save minimum");
+}
+
 // Automate the title's native Continue and session-start operations. Keep the
 // game's asynchronous session driver running; never fabricate a Session/DB.
 void OnTitleStage(hook::Ctx* c) {
-    if (g_titleContinued) return;
+    if (!g_cfg.enabled) return;
+    if (!g_startupLogoDone) FinishTitlePrefetch();
+    g_startupLogoDone = true;
     const uintptr_t t = static_cast<uintptr_t>(c->rcx);
     if (!t || !Readable(t + 0x74, 4)) return;
     const uint32_t st = Rd32(t + 0x74);
+    // PREPARE normally restores the return policy first. Cover soft title
+    // re-entry too, even if the engine reuses the same aTitle object.
+    if (g_titleContinued && st <= 8) ApplyReturnTitlePolicy();
+    static uint32_t previousState = ~0u;
+    static uint32_t previousMenu = ~0u;
+    const uint32_t menu = Rd32(t + 0xB4);
+    if (st != previousState || (st == 4 && menu != previousMenu)) {
+        previousState = st;
+        previousMenu = menu;
+        LogLine("boot-trace: aTitle state=0x%X menu=%u", st, menu);
+    }
+    if (st == 4 && menu == 1) {
+        const uintptr_t user = P(g_exeBase + kPSave);
+        const uintptr_t content = user ? user + 0x1F980 : 0;
+        if (content && Readable(content, 0x1555)) {
+            const uint32_t contentState = Rd32(content + 0x50);
+            const uint8_t alternate = *reinterpret_cast<const uint8_t*>(content + 0x1554);
+            static uint32_t previousContent = ~0u;
+            const uint32_t key = contentState | (static_cast<uint32_t>(alternate) << 24);
+            if (key != previousContent) {
+                previousContent = key;
+                LogLine("boot-trace: title content state=%u alternate=%u", contentState, alternate);
+            }
+            // 1402999D0 -> 14029AD00 state6, or 14029B040 byte-state2.
+            // Both consume +8 as a 1.5-second message hold, before native work.
+            if (contentState == 6 || alternate == 2)
+                ClearTransitionWait(content + 8, "title content message minimum");
+            // 14029AFA0 owns the embedded save operation at +10.
+            if (Rd32(content + 0xC) == 2)
+                ClearCompletedSaveWait(content + 0x10, "title content completed save minimum");
+        }
+    }
+    if (st == 0x18) ClearTransitionWait(t + 0x320, "aTitle transition");
+    if (g_cfg.title_screen_only) {
+        if (st == 1 || st == 5 || st == 6 || (st == 4 && menu == 2)) {
+            static bool readyLogged = false;
+            if (!readyLogged) {
+                readyLogged = true;
+                LogLine("title-only: native title boot ready; waiting for player input");
+                FlushStartupProfile();
+            }
+        }
+        return;
+    }
+    if (g_titleContinued) return;
+    if (WaitForCreditsRestore(c, t, st)) return;
+    ObserveCreditsTrim(t, st);
+    ObserveOmittedTitleScene(t, st);
     if (st == 0x18 || st == 0x12) return;   // transition / post-continue state
     // Preserve native startup initialization before selecting the save.
     if (st < 4) return;
@@ -300,6 +468,7 @@ void OnTitleStage(hook::Ctx* c) {
 
                     const auto createHub = reinterpret_cast<char (*)(
                         uintptr_t, uint32_t, uintptr_t, uintptr_t)>(g_exeBase + 0x1AFE690);
+                    ApplySavedHubDestination();
                     const char accepted = createHub(net, 1, 0, 0);
                     LogLine("title-fp: native hub create(net,1,0,0) returned %d (service=%d saved-lobby-settings=1)",
                             static_cast<int>(accepted), service);
@@ -366,7 +535,8 @@ void OnTitleStage(hook::Ctx* c) {
     }
     if (st == 0x11) {
         g_titleContinued = true;
-        LogLine("title-fp: native quest-entry state reached");
+        LogLine("title-fp: native %s-entry state reached", g_cfg.title_only_hub ? "hub" : "quest");
+        FlushStartupProfile();
     }
     return;
 }
@@ -390,17 +560,68 @@ bool PatchBytes(HMODULE exe, uintptr_t rva, const unsigned char* expected,
 }
 
 bool PatchAll(const Config& cfg, HMODULE exe) {
-    if (!cfg.enabled) return true;
-    if (!PatchBytes(exe, kOnePhaseJump, kOnePhaseExpected, kOnePhasePatched,
-                    sizeof(kOnePhasePatched))) return false;
+    if (!cfg.enabled || cfg.title_screen_only) return true;
     // OnTitleStage performs this initialization with preservation of DLC flags.
     if (!PatchBytes(exe, kDlcInitCall, kDlcInitExpected, kDlcInitPatched,
                     sizeof(kDlcInitPatched))) return false;
+    // Hub mode uses the same accelerated save/session startup but retains the
+    // native progression/hub dispatch instead of redirecting it to a quest.
+    if (cfg.title_only_hub) return true;
+    if (!PatchBytes(exe, kOnePhaseJump, kOnePhaseExpected, kOnePhasePatched,
+                    sizeof(kOnePhasePatched))) return false;
     unsigned char id[4];
     const uint32_t qid = static_cast<uint32_t>(cfg.quest_id);
     memcpy(id, &qid, sizeof(id));
     return PatchBytes(exe, kQuestId1, kQuestIdExpected, id, sizeof(id)) &&
            PatchBytes(exe, kQuestId2, kQuestIdExpected, id, sizeof(id));
+}
+
+void ApplyReturnTitlePolicy() {
+    if (!g_cfg.enabled || g_cfg.title_screen_only || !g_titleContinued || g_returnTitlePolicyApplied) return;
+    unsigned char id[4];
+    const uint32_t qid = static_cast<uint32_t>(g_cfg.quest_id);
+    memcpy(id, &qid, sizeof(id));
+    const uintptr_t rvas[] = {kDlcInitCall,kOnePhaseJump,kQuestId1,kQuestId2};
+    const unsigned char* original[] = {kDlcInitExpected,kOnePhaseExpected,kQuestIdExpected,kQuestIdExpected};
+    const unsigned char* applied[] = {kDlcInitPatched,kOnePhasePatched,id,id};
+    const size_t lengths[] = {5,2,4,4};
+    const bool redirectQuest = g_cfg.rehook_on_return && !g_cfg.title_only_hub;
+    const unsigned count = redirectQuest ? 1u : 4u;
+    for (unsigned i=0;i<count;++i) {
+        const uintptr_t site=g_exeBase+rvas[i];
+        if (!Readable(site,lengths[i]) ||
+            (memcmp(reinterpret_cast<const void*>(site),applied[i],lengths[i]) &&
+             memcmp(reinterpret_cast<const void*>(site),original[i],lengths[i]))) {
+            if (!g_returnTitleRestoreWarning) {
+                g_returnTitleRestoreWarning=true;
+                LogLine("return-title: restore refused; startup site changed at RVA %llX",static_cast<unsigned long long>(rvas[i]));
+            }
+            return;
+        }
+    }
+    // All four sites share this page. Preflight the complete set, then restore
+    // together on the title thread before the player can select a save.
+    const uintptr_t page=g_exeBase+0x25F000;
+    DWORD old=0;
+    if (!VirtualProtect(reinterpret_cast<void*>(page),0x1000,PAGE_EXECUTE_READWRITE,&old)) {
+        if (!g_returnTitleRestoreWarning) {
+            g_returnTitleRestoreWarning=true;
+            LogLine("return-title: could not make startup patch page writable");
+        }
+        return;
+    }
+    for (unsigned i=0;i<count;++i)
+        memcpy(reinterpret_cast<void*>(g_exeBase+rvas[i]),original[i],lengths[i]);
+    DWORD ignored=0;
+    VirtualProtect(reinterpret_cast<void*>(page),0x1000,old,&ignored);
+    FlushInstructionCache(GetCurrentProcess(),reinterpret_cast<void*>(page),0x1000);
+    g_returnTitlePolicyApplied=true;
+    LogLine("return-title: %s; native DLC initialization restored",
+            redirectQuest ? "save selection still redirects to configured quest" : "native save-to-hub entry restored");
+}
+
+void HandleTitleReturnPrepare(uintptr_t title) {
+    if (title && Readable(title+0x60,4) && Rd32(title+0x60)==0) ApplyReturnTitlePolicy();
 }
 
 bool g_logoHookInstalled = false;
@@ -443,6 +664,35 @@ bool InstallHookOnce(HMODULE exe) {
 
     // Install independently of the later title hook: the worker must not
     // report ready and exit before this earlier startup handler is patched.
+    const uintptr_t profileSites[2] = {base + 0x24C4E0, base + 0x25DA80};
+    const unsigned char profileBytes[2][10] = {
+        {0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20},
+        {0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x57, 0x41, 0x57, 0},
+    };
+    const size_t profileLengths[2] = {10, 9};
+    const hook::Handler profileHandlers[2] = {&OnLogoPrepare, &OnTitlePrepare};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (g_profileHooksInstalled[i]) continue;
+        if (!Readable(profileSites[i], profileLengths[i]) ||
+            memcmp(reinterpret_cast<const void*>(profileSites[i]), profileBytes[i], profileLengths[i]) != 0)
+            return false;
+        if (!hook::InstallCtxHook(profileSites[i], profileLengths[i], profileHandlers[i],
+                                  profileBytes[i], profileLengths[i])) return false;
+        g_profileHooksInstalled[i] = true;
+        LogLine("resource-profile: prepare hook %u installed", i);
+    }
+
+    if (!g_logoExecuteHookInstalled) {
+        const uintptr_t site = base + kLogoExecute;
+        if (!Readable(site, sizeof(kLogoExecuteExpected)) ||
+            memcmp(reinterpret_cast<const void*>(site), kLogoExecuteExpected,
+                   sizeof(kLogoExecuteExpected)) != 0) return false;
+        if (!hook::InstallCtxHook(site, sizeof(kLogoExecuteExpected), &OnLogoExecute,
+                                  kLogoExecuteExpected, sizeof(kLogoExecuteExpected))) return false;
+        g_logoExecuteHookInstalled = true;
+        LogLine("timer-skip: startup aLogo transition hook installed");
+    }
+
     if (!g_logoHookInstalled) {
         const uintptr_t site = base + kLogoStart;
         if (!Readable(site, sizeof(kLogoStartExpected)) ||
@@ -472,7 +722,39 @@ bool InstallHookOnce(HMODULE exe) {
         LogLine("title hook installed at %p", reinterpret_cast<void*>(site));
     }
 
-    return g_logoHookInstalled && g_titleHookInstalled;
+    if (g_cfg.title_screen_only)
+        return g_logoExecuteHookInstalled && g_logoHookInstalled && g_titleHookInstalled;
+    if (!g_sceneRequestHookTried) {
+        g_sceneRequestHookTried = true;
+        const uintptr_t site = base + kTitleSceneRequest;
+        if (Readable(site, sizeof(kTitleSceneRequestExpected)) &&
+            memcmp(reinterpret_cast<const void*>(site), kTitleSceneRequestExpected,
+                   sizeof(kTitleSceneRequestExpected)) == 0) {
+            // The handler implements the displaced CALL itself. Copying a
+            // relative CALL into the trampoline would target the wrong address.
+            const unsigned char noCall[] = {0x90, 0x90, 0x90, 0x90, 0x90};
+            g_sceneRequestHookInstalled = hook::InstallCtxHook(
+                site, sizeof(kTitleSceneRequestExpected), &OnTitleSceneRequest, noCall, sizeof(noCall));
+        }
+        LogLine("title-scene: request gate %s", g_sceneRequestHookInstalled ? "installed" : "unavailable; retaining native request");
+    }
+    if (!g_creditsGatesTried) {
+        g_creditsGatesTried = true;
+        const uintptr_t sites[] = {base + 0x25DD2E, base + 0x25D67E};
+        const uintptr_t targets[] = {base + 0x1B80C70, base + 0xA7E980};
+        const hook::Handler handlers[] = {&OnCreditsSubmit, &OnCreditsUnitCreate};
+        const unsigned char noCall[] = {0x90,0x90,0x90,0x90,0x90};
+        for (unsigned i = 0; i < 2; ++i) {
+            if (!Readable(sites[i], 5) || *reinterpret_cast<const uint8_t*>(sites[i]) != 0xE8) continue;
+            int32_t rel = 0; memcpy(&rel,reinterpret_cast<const void*>(sites[i]+1),4);
+            if (static_cast<int64_t>(sites[i]+5)+rel != static_cast<int64_t>(targets[i])) continue;
+            g_creditsGateInstalled[i] = hook::InstallCtxHook(sites[i],5,handlers[i],noCall,5);
+        }
+        g_trimCreditsPrefetch = g_creditsGateInstalled[0] && g_creditsGateInstalled[1];
+        LogLine("credits-trim: request/creation gates=%u/%u armed=%u", g_creditsGateInstalled[0] ? 1u:0u,
+                g_creditsGateInstalled[1] ? 1u:0u,g_trimCreditsPrefetch ? 1u:0u);
+    }
+    return g_logoExecuteHookInstalled && g_logoHookInstalled && g_titleHookInstalled;
 }
 
 DWORD WINAPI Worker(LPVOID) {
