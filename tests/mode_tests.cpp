@@ -79,4 +79,3 @@ int main(){
  puts("PASS: actual INI parsing/defaults, first entry retained, both return policies, soft re-entry, unknown-edit refusal.");
  puts("PASS: title-only timers without resource/selection/quest changes; real optional hooks absent; disabled behavior and mode precedence.");
 }
-
