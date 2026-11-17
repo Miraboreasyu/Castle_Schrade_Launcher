@@ -86,10 +86,12 @@ void OnLogoPrepare(hook::Ctx* c) {
     }
     if (state >= 2) ProfileTicket(0, "logo", Rd32(owner + 0x44));
     if (state >= 5) ProfileTicket(1, "base-gui", Rd32(owner + 0x48));
+    AdvanceResidentBuild(owner, state);
 }
 
 void OnTitlePrepare(hook::Ctx* c) {
     if (!g_cfg.enabled) return;
+    CloseStartupFontWindow();
     HandleTitleReturnPrepare(static_cast<uintptr_t>(c->rcx));
     if (g_startupLogoDone) return;
     PollTitlePrefetch();

@@ -39,6 +39,8 @@ quest_id=66845
 
 真实资源加载和 I/O 就绪条件仍保留。自动模式提前请求部分启动资源，并裁剪启动标题场景与制作人员表资源；返回标题时恢复需要的原生资源路径。只到标题模式不启用预加载或裁剪。
 
+自动模式还提高首次常驻索引构建的每帧预算，并将首次字体刷新的批量字形预热改为原生按需生成。字体加载、语言绑定及后续设置刷新保留。用户实测常驻构建约73–107ms；字体就绪到标题准备的样本跨度由468ms降到312ms，未观测到卡顿。这些是单次日志对比，不是固定性能保证。日志 `resident-budget` 与 `font-startup` 可用于核对。
+
 不要重命名 DLL 或 INI；不要通过删除 INI 停用插件。日志位于 DLL 旁的 `auto_quest_start.log`，其中 `hub-area` 记录存档开始区域选项。卸载时删除两个插件文件。
 
 ## 验证与兼容性
@@ -59,6 +61,8 @@ The shipped configuration automatically selects save slot 0 and creates a sessio
 - `enabled=0` disables the entire plugin. `save_slot` is zero-based; empty slots do not fall back to another character.
 
 The release includes `quest_id.csv` as a reference; it does not need to be installed. Do not rename the DLL or INI. IN-Q is optional and independently configured. Full configuration details are in [CONFIGURATION.md](CONFIGURATION.md).
+
+Automatic modes also increase the startup resident-index work budget and defer exhaustive glyph prewarming to native on-demand generation. Font loading and binding remain native, as do subsequent settings refreshes. The user observed no stuttering in the tested run; performance varies. These optimizations are disabled in title-screen-only mode.
 
 ## 构建与打包 / Build
 

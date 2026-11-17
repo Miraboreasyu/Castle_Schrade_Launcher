@@ -19,7 +19,70 @@ void FullReset(bool rehook){
  g_titleContinued=false;g_startupLogoDone=true;g_returnTitlePolicyApplied=false;g_returnTitleRestoreWarning=false;
  assert(PatchAll(g_cfg,(HMODULE)g_exeBase));CheckSites(true,true);
 }
+int64_t budgetTestTime = 0, budgetTestCost = 0;
+unsigned budgetTestCalls = 0, budgetTestFinish = 0;
+int64_t BudgetTestClock() { return budgetTestTime; }
+uint64_t BudgetTestStep(uintptr_t resident, uint32_t mode) {
+ assert(mode == 3 && Rd32(resident + 0x38) == 4);
+ ++budgetTestCalls; budgetTestTime += budgetTestCost;
+ if (budgetTestFinish && budgetTestCalls == budgetTestFinish) Wr32(resident + 0x38, 5);
+ return 1; // Return value alone must not fabricate resident completion.
+}
+void CheckResidentSlices() {
+ unsigned char resident[0x80]{};
+ const auto r = (uintptr_t)resident;
+ Wr32(r + 0x38, 4);
+ auto slice = RunResidentBuildSlice(r, &BudgetTestStep, &BudgetTestClock, 2000);
+ assert(slice.calls == 7 && budgetTestCalls == 7 && Rd32(r + 0x38) == 4);
+ budgetTestCalls = 0; budgetTestTime = 0; budgetTestCost = 900;
+ slice = RunResidentBuildSlice(r, &BudgetTestStep, &BudgetTestClock, 2000);
+ assert(slice.calls == 3 && slice.elapsed == 2700); // Soft limit, checked between calls.
+ budgetTestCalls = 0; budgetTestTime = 0; budgetTestCost = 100; budgetTestFinish = 2;
+ slice = RunResidentBuildSlice(r, &BudgetTestStep, &BudgetTestClock, 2000);
+ assert(slice.calls == 2 && Rd32(r + 0x38) == 5);
+ for (uint32_t state : {2u, 3u, 5u, 9u, 11u}) {
+  Wr32(r + 0x38, state); budgetTestCalls = 0;
+  slice = RunResidentBuildSlice(r, &BudgetTestStep, &BudgetTestClock, 2000);
+  assert(!slice.calls && !budgetTestCalls && Rd32(r + 0x38) == state);
+ }
+ puts("PASS: resident extra-call/time bounds and stop before native I/O phases.");
+}
+unsigned fontTestForwarded = 0;
+void TestFontWarmNative(uintptr_t manager, uintptr_t chars, uintptr_t font, uint32_t width, uint32_t height, uintptr_t size) {
+ assert(manager == 11 && chars != 0 && font == 33 && width == 32 && height == 48 && size == 66);
+ ++fontTestForwarded;
+}
+void TestFontRefreshNative(uintptr_t gui, uint32_t language) {
+ assert(gui == 77 && language == 8);
+ unsigned char chars[0xB0]{}; Wr32((uintptr_t)chars + 0xAC, 123);
+ hook::Ctx c{}; c.rcx=11; c.rdx=(uintptr_t)chars; c.r8=33; c.r9=32;
+ HandleFontWarm(&c, 0, &TestFontWarmNative, 48, 66);
+ HandleFontWarm(&c, 1, &TestFontWarmNative, 48, 66);
+}
+void CheckFontScope() {
+ g_cfg={}; g_fontStartupWindow=true;
+ for (auto& installed:g_fontHooks) installed=true;
+ hook::Ctx c{}; c.rcx=77; c.rdx=8;
+ HandleFontRefresh(&c,&TestFontRefreshNative);
+ assert(!fontTestForwarded && g_fontRefreshUsed && !g_fontDeferScope);
+ assert(g_fontWarmCalls[0]==1 && g_fontWarmCharacters[0]==123 && g_fontWarmCharacters[1]==123);
+ HandleFontRefresh(&c,&TestFontRefreshNative); // Subsequent language refresh is fully native.
+ assert(fontTestForwarded==2);
+ g_fontRefreshUsed=false; g_cfg.title_screen_only=true;
+ HandleFontRefresh(&c,&TestFontRefreshNative); assert(fontTestForwarded==4 && !g_fontRefreshUsed);
+ g_cfg.title_screen_only=false; g_fontHooks[2]=false;
+ HandleFontRefresh(&c,&TestFontRefreshNative); assert(fontTestForwarded==6);
+ g_fontHooks[2]=true; CloseStartupFontWindow();
+ HandleFontRefresh(&c,&TestFontRefreshNative); assert(fontTestForwarded==8);
+ g_fontRefreshUsed=false; g_fontStartupWindow=false;
+ for (auto& installed:g_fontHooks) installed=false;
+ for (auto& n:g_fontWarmCalls) n=0;
+ for (auto& n:g_fontWarmCharacters) n=0;
+ puts("PASS: font warm deferral limited to first startup refresh, with complete native forwarding otherwise.");
+}
 int main(){
+ CheckFontScope();
+ CheckResidentSlices();
  // Missing new keys retain the previous complete-auto behavior.
  WriteIni("[auto_quest_start]\nenabled=1\nsave_slot=1\nquest_id=12345\n");
  auto cfg=LoadConfig();assert(cfg.enabled&&!cfg.title_screen_only&&cfg.rehook_on_return&&cfg.save_slot==1&&cfg.quest_id==12345);

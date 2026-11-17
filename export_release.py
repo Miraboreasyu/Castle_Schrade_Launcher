@@ -45,7 +45,7 @@ def main():
         'archive': archive.name,
         'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
         'files': {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
-        'runtime_regression_test': 'user confirmed mode switches and saved hub-area routing in-game',
+        'runtime_regression_test': 'user confirmed saved hub-area routing; resident budget and glyph deferral reached quest entry, no stuttering observed in glyph test',
     }
     (OUT / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(manifest, indent=2))

@@ -256,7 +256,11 @@ void ClearCompletedSaveWait(uintptr_t operation, const char* phase) {
 void PollTitlePrefetch();
 void HandleTitleReturnPrepare(uintptr_t title);
 void ApplyReturnTitlePolicy();
+void AdvanceResidentBuild(uintptr_t logo, uint32_t logoState);
+void CloseStartupFontWindow();
 #include "startup_profile.h"
+#include "startup_resident_budget.h"
+#include "startup_font.h"
 #include "startup_prefetch.h"
 #include "startup_scene_skip.h"
 #include "startup_credits_trim.h"
@@ -272,6 +276,7 @@ void OnLogoExecute(hook::Ctx* c) {
         PollTitlePrefetch();
     }
     if (state == 0x16) {
+        if (Rd32(logo + 0xA0) == 2) g_fontStartupWindow = true;
         ProfileStage(2, "font-prepare", Rd32(logo + 0xA0));
         if (Rd32(logo + 0xA0) >= 1) ProfileTicket(2, "font", Rd32(logo + 0x4C));
     }
@@ -754,6 +759,7 @@ bool InstallHookOnce(HMODULE exe) {
         LogLine("credits-trim: request/creation gates=%u/%u armed=%u", g_creditsGateInstalled[0] ? 1u:0u,
                 g_creditsGateInstalled[1] ? 1u:0u,g_trimCreditsPrefetch ? 1u:0u);
     }
+    InstallStartupFontHooks();
     return g_logoExecuteHookInstalled && g_logoHookInstalled && g_titleHookInstalled;
 }
 
