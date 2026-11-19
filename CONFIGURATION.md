@@ -18,6 +18,8 @@ title_only_hub=1
 rehook_on_return=0
 save_slot=0
 quest_id=66845
+dx11_fast=1
+dx12_fast=1
 ```
 
 请保留 `[auto_quest_start]` 分节名称和各配置项的英文拼写，只修改等号右侧的数字。以 `;` 开头的行是说明注释，不影响设置。建议用 UTF-8 保存，避免误存为 `.ini.txt`。
@@ -93,11 +95,18 @@ quest_id=66845
 
 请选择该角色能够正常承接的任务。任务 ID 数值通过检查不代表任务一定存在或角色已经满足接取条件；不要随意填写数字。
 
+### dx11_fast 与 dx12_fast：实验性图形 API 加速开关
+
+- `dx11_fast=1`（默认）：在 DX11 模式下启用实验性启动加速（后台异步 + 按需编译着色器、按需创建 `ID3D11Predicate` 查询池、跳过无效 DX12 PSO 缓存读取）。设为 `0` 时不安装任何 DX11 加速 hook。
+- `dx12_fast=1`（默认）：在 DX12 模式下启用实验性加载加速（使用 64MB `ID3D12Heap` Placed Resource 池化分配默认堆纹理与缓冲区，减少驱动内核分配开销）。设为 `0` 时不安装任何 DX12 加速 hook。
+
+由于这两项图形底层优化处于早期阶段，如遇驱动兼容或画面/显存异常，可单独设为 `0` 并重启游戏以回退至原版图形资源路径。`title_screen_only=1` 时两者均不启用。
+
 ### 集会与 IN-Q
 
 集会设置沿用该存档中保存的设置，包括隐私偏好；请在游戏内修改并正常保存，无需在此 INI 中添加集会字段。
 
-IN-Q 使用它自己的配置。本 mod 的公开配置共六项，无需额外添加 IN-Q 相关配置项。
+IN-Q 使用它自己的配置。本 mod 的公开配置共八项，无需额外添加 IN-Q 相关配置项。
 
 ### 常见问题
 
@@ -127,6 +136,8 @@ title_only_hub=1
 rehook_on_return=0
 save_slot=0
 quest_id=66845
+dx11_fast=1
+dx12_fast=1
 ```
 
 Keep the section name `[auto_quest_start]` and the setting names unchanged. Edit only the numbers after `=`. Lines beginning with `;` are comments. Save as UTF-8 and make sure the filename does not end in `.ini.txt`.
@@ -177,11 +188,18 @@ quest_id=66845
 
 Choose a quest that your character can normally accept. A numeric ID passing validation does not guarantee that the quest exists or that the character meets its requirements.
 
+### dx11_fast and dx12_fast — Experimental graphics API accelerations
+
+- `dx11_fast=1` (default): Enables experimental DX11 startup acceleration (background + on-demand shader compilation, lazy `ID3D11Predicate` pool, and skipping unused DX12 PSO cache loads). Setting `0` skips installing all DX11 acceleration hooks.
+- `dx12_fast=1` (default): Enables experimental DX12 loading acceleration (64 MB `ID3D12Heap` placed-resource sub-allocators for default-heap textures and buffers). Setting `0` skips installing all DX12 acceleration hooks.
+
+Because these low-level graphics optimizations are experimental, set either option to `0` and restart the game if you encounter any driver compatibility, rendering, or VRAM issues. Neither option is active when `title_screen_only=1`.
+
 ### Session settings and IN-Q
 
 Gathering-session settings, including privacy preferences, are inherited from the selected save. Change and save those settings in the game; do not add session fields to this INI.
 
-IN-Q keeps its own configuration. No additional IN-Q settings are required in this mod's INI. The public configuration consists of six options.
+IN-Q keeps its own configuration. No additional IN-Q settings are required in this mod's INI. The public configuration consists of eight options.
 
 ### Troubleshooting
 

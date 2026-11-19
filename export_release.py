@@ -13,8 +13,8 @@ OUT = ROOT / 'dist'
 
 def main():
     ini = (ROOT / 'auto_quest_start.ini').read_bytes()
-    keys = re.findall(r'^([a-z_]+)\s*=', ini.decode('utf-8-sig'), re.M)
-    if keys != ['enabled', 'title_screen_only', 'title_only_hub', 'rehook_on_return', 'save_slot', 'quest_id']:
+    keys = re.findall(r'^([a-z0-9_]+)\s*=', ini.decode('utf-8-sig'), re.M)
+    if keys != ['enabled', 'title_screen_only', 'title_only_hub', 'rehook_on_return', 'save_slot', 'quest_id', 'dx11_fast', 'dx12_fast']:
         raise ValueError(f'Unexpected public settings: {keys}')
     quests = (ROOT / 'quest_ids.csv').read_bytes()
     rows = list(csv.reader(io.StringIO(quests.decode('utf-8-sig'))))

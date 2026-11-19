@@ -1,12 +1,18 @@
 // Castle Schrade Launcher: native startup, saved gathering settings and quest entry.
 // Version-specific in-memory patches; no IN-Q bridge or loadout customization.
 #include <windows.h>
+#include <d3d12.h>
+#include <malloc.h>
+#include <share.h>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include "hook.h"
 
 namespace {
@@ -53,6 +59,8 @@ struct Config {
     bool rehook_on_return = true;
     int save_slot = 0;
     int quest_id = 66845;
+    bool dx11_fast = true;
+    bool dx12_fast = true;
 };
 Config g_cfg;
 uintptr_t g_exeBase = 0;
@@ -75,14 +83,31 @@ void LogLine(const char* fmt, ...) {
     GetModuleFileNameA(self, path, MAX_PATH);
     char* slash = strrchr(path, '\\');
     if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "auto_quest_start.log");
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") == 0 && f) {
+    FILE* f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) {
         va_list ap;
         va_start(ap, fmt);
         fprintf(f, "[%llu ms] ", static_cast<unsigned long long>(GetTickCount64()));
         vfprintf(f, fmt, ap);
         va_end(ap);
         fputc('\n', f);
+        fclose(f);
+    }
+}
+
+void LogRawBlock(const std::string& block) {
+    if (block.empty()) return;
+    char path[MAX_PATH]{};
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&LogLine), &self);
+    GetModuleFileNameA(self, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "auto_quest_start.log");
+    FILE* f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) {
+        fwrite(block.data(), 1, block.size(), f);
         fclose(f);
     }
 }
@@ -158,6 +183,8 @@ Config LoadConfig() {
     c.rehook_on_return = IniGet(ini, "auto_quest_start", "rehook_on_return", 1) != 0;
     c.save_slot = IniGet(ini, "auto_quest_start", "save_slot", 0);
     c.quest_id = IniGet(ini, "auto_quest_start", "quest_id", 66845);
+    c.dx11_fast = IniGet(ini, "auto_quest_start", "dx11_fast", 1) != 0;
+    c.dx12_fast = IniGet(ini, "auto_quest_start", "dx12_fast", 1) != 0;
     if (c.save_slot < 0 || c.save_slot > 2) {
         LogLine("config: invalid save_slot=%d; using slot 0", c.save_slot);
         c.save_slot = 0;
@@ -166,9 +193,10 @@ Config LoadConfig() {
         LogLine("config: invalid quest_id=%d; using 66845", c.quest_id);
         c.quest_id = 66845;
     }
-    LogLine("config: enabled=1 title_screen_only=%u title_only_hub=%u rehook_on_return=%u save_slot=%d quest_id=%d",
+    LogLine("config: enabled=1 title_screen_only=%u title_only_hub=%u rehook_on_return=%u save_slot=%d quest_id=%d dx11_fast=%u dx12_fast=%u",
             c.title_screen_only ? 1u : 0u, c.title_only_hub ? 1u : 0u,
-            c.rehook_on_return ? 1u : 0u, c.save_slot, c.quest_id);
+            c.rehook_on_return ? 1u : 0u, c.save_slot, c.quest_id,
+            c.dx11_fast ? 1u : 0u, c.dx12_fast ? 1u : 0u);
     return c;
 }
 
@@ -258,21 +286,53 @@ void HandleTitleReturnPrepare(uintptr_t title);
 void ApplyReturnTitlePolicy();
 void AdvanceResidentBuild(uintptr_t logo, uint32_t logoState);
 void CloseStartupFontWindow();
+void RecordDx12PlacedStats();
 #include "startup_profile.h"
 #include "startup_resident_budget.h"
 #include "startup_font.h"
+#include "startup_save_fast.h"
+#include "startup_dx11_fast.h"
+#include "startup_dx12_fast.h"
 #include "startup_prefetch.h"
 #include "startup_scene_skip.h"
 #include "startup_credits_trim.h"
+
+bool g_dx12FallbackChecked = false;
+void CheckDx12FallbackCleanup() {
+    if (g_dx12FallbackChecked || !g_cfg.enabled || g_cfg.title_screen_only) return;
+    g_dx12FallbackChecked = true;
+    const uintptr_t render = P(g_exeBase + 0x51C4480);
+    if (!render || !Readable(render + 0x7B414, 1)) return;
+    if (*reinterpret_cast<const uint8_t*>(render + 0x7B414) == 0) return;
+    // Vanilla aTitle main menu (0x14025F8A3) calls FUN_1422937C0(sMhRender) to clear
+    // rendering_api_fallback.txt; skipping main menu would otherwise trap DX11 forever.
+    constexpr uintptr_t kFallbackCleanupRva = 0x22937C0;
+    const unsigned char expected[13] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x80, 0xB9, 0x14, 0xB4, 0x07, 0x00, 0x00,
+    };
+    if (Readable(g_exeBase + kFallbackCleanupRva, sizeof(expected)) &&
+        memcmp(reinterpret_cast<const void*>(g_exeBase + kFallbackCleanupRva),
+               expected, sizeof(expected)) == 0) {
+        LogLine("[WARN] dx12-fallback-detected: rendering_api_fallback.txt forced DX11; invoking native cleanup 0x1422937C0");
+        reinterpret_cast<void (__fastcall*)(uintptr_t)>(g_exeBase + kFallbackCleanupRva)(render);
+    } else {
+        LogLine("[WARN] dx12-fallback-detected: rendering_api_fallback.txt forced DX11 (cleanup signature mismatch)");
+    }
+}
 
 void OnLogoExecute(hook::Ctx* c) {
     if (!g_cfg.enabled || g_startupLogoDone) return;
     const uintptr_t logo = static_cast<uintptr_t>(c->rcx);
     if (!logo || !Readable(logo + 0x50, 4)) return;
-    const uint32_t state = Rd32(logo + 0x50);
+    uint32_t state = Rd32(logo + 0x50);
     if (!g_cfg.title_screen_only) {
-        if (state == 0x16) StopTitlePrefetchAttempts();
-        else StartTitlePrefetch();
+        if (state == 0x16) {
+            StopTitlePrefetchAttempts();
+            StartResidentLocalizedPrefetch();
+        } else {
+            StartTitlePrefetch();
+            if (state == 0x9 || state == 0x15) StartResidentLocalizedPrefetchIfLanguageReady();
+        }
         PollTitlePrefetch();
     }
     if (state == 0x16) {
@@ -285,8 +345,20 @@ void OnLogoExecute(hook::Ctx* c) {
         previous = state;
         LogLine("boot-trace: aLogo state=0x%X", state);
     }
-    if (state == 0x17)
+    if (state == 0x17) {
         ClearTransitionWait(logo + 0x1C8, "aLogo transition");
+        // Collapse zero-timer 0x17 bounce frames cleanly (mirroring 0x14024D162..0x14024D170).
+        if (!g_cfg.title_screen_only && Readable(logo + 0x1C0, 0x12) && Rd32(logo + 0x1C8) == 0) {
+            const uint32_t nextState = Rd32(logo + 0x1C0);
+            if (nextState < 0x17) {
+                if (*reinterpret_cast<const uint8_t*>(logo + 0x1D1))
+                    *reinterpret_cast<uint8_t*>(logo + 0x1D0) = 1;
+                Wr32(logo + 0x50, nextState);
+                state = nextState;
+            }
+        }
+    }
+    TryApplySilentLogoSaveLoad(logo, state);
     // Only inspect the operation while its owning aLogo case is polling it.
     const bool polling = (state == 5 && (Rd32(logo + 0x58) == 5 || Rd32(logo + 0x58) == 8)) ||
         (state == 6 && Rd32(logo + 0x5C) == 2) ||
@@ -308,6 +380,9 @@ void OnTitleStage(hook::Ctx* c) {
     // PREPARE normally restores the return policy first. Cover soft title
     // re-entry too, even if the engine reuses the same aTitle object.
     if (g_titleContinued && st <= 8) ApplyReturnTitlePolicy();
+    if (!g_titleContinued && st <= 8 && (g_playableQuestPrefetched || g_playablePrefetch.id != ~0u)) {
+        AbortPlayableOverlapPrefetch();
+    }
     static uint32_t previousState = ~0u;
     static uint32_t previousMenu = ~0u;
     const uint32_t menu = Rd32(t + 0xB4);
@@ -382,6 +457,13 @@ void OnTitleStage(hook::Ctx* c) {
             LogLine("title: DLC init with flag merge (%u old flags preserved)", preserved);
             g_dlcEnumerated = true;
             g_dlcTried = true;
+            // Capture exact pre-content-check sUserData digest AFTER all of aLogo's
+            // unpack/SteamID/DLC setup completes and RIGHT BEFORE cContentCheck runs.
+            if (!g_saveBaseline.valid) {
+                g_saveBaseline = ComputeUserDataDigest(save);
+                if (g_saveBaseline.valid)
+                    ProfileRecord("content-skip: captured pre-content-check sUserData baseline digest");
+            }
         } else {
             if (!g_titleFirstSeen) {
                 g_titleFirstSeen = GetTickCount64();
@@ -445,13 +527,15 @@ void OnTitleStage(hook::Ctx* c) {
     // Its own entry guard accepts service states 2, 4 and 5 only. Waiting
     // for that guard avoids the old invalid-state call and fixed sleeps.
     if (st == 0xF && continueSelected) {
-        const uint32_t substate = Rd32(t + 0xD0);
+        uint32_t substate = Rd32(t + 0xD0);
         if (substate == 4 && !nativeNetworkInit) {
             reinterpret_cast<VoidTitleFn>(g_exeBase + 0x261180)(t);
             nativeNetworkInit = true;
             skipDuplicateTitleCall();
             LogLine("title-fp: native selected-save/network base initialization requested");
-        } else if (substate >= 5 && nativeNetworkInit && !hubCreateRequested) {
+            substate = Rd32(t + 0xD0);
+        }
+        if (substate >= 5 && nativeNetworkInit && !hubCreateRequested) {
             const uintptr_t net = P(g_exeBase + kPNet);
             if (net && Rd32(net + 0x51AD4) != 4) {
                 const auto serviceState = reinterpret_cast<int (*)(
@@ -481,6 +565,7 @@ void OnTitleStage(hook::Ctx* c) {
                         Wr32(t + 0x74, 0x13);
                         hubCreateRequested = true;
                         skipDuplicateTitleCall();
+                        StartPlayableOverlapPrefetch();
                     }
                 } else {
                     // Suppress only the title's menu case while the native
@@ -493,11 +578,11 @@ void OnTitleStage(hook::Ctx* c) {
     }
 
     // Native state 0x13 waits for mSelfIndex's member-ready value to become
-    // 1 (net+0x549F4[selfIndex*4]). Its original transition additionally
-    // requires the online attribute. For a genuinely offline Session, keep
-    // the native wait but do not invent that attribute. Network errors are
-    // left to the original title error handler.
+    // 1 (net+0x549F4[selfIndex*4]). Use zero-fade transition (param_5 = 0)
+    // for both online and offline ready sessions so 0x14025FDE0 does not stall
+    // for 0.100s on a blank screen. Network errors still use the native handler.
     if (st == 0x13 && continueSelected && nativeNetworkInit) {
+        PollPlayableOverlapPrefetch();
         const uintptr_t net = P(g_exeBase + kPNet);
         const uintptr_t session = net ? P(net + 0x260) : 0;
         const uintptr_t db = session ? P(session + 0x10) : 0;
@@ -509,12 +594,13 @@ void OnTitleStage(hook::Ctx* c) {
             attribute = Rd32(db + 0xBFF0);
             if (self >= 0 && self < 16) ready = Rd32(net + 0x549F4 + self * 4);
         }
-        if (ready == 1 && (attribute & 1) == 0) {
+        if (ready == 1) {
             reinterpret_cast<NativeTransitionFn>(g_exeBase + 0x25C5C0)(
                 t, 0x11, 0.0f, 0.0f, 0, 0.0f, 0);
             *reinterpret_cast<volatile uint8_t*>(t + 0x389) = 1;
             skipDuplicateTitleCall();
-            LogLine("title-fp: offline hub Session ready; native quest transition requested");
+            LogLine("title-fp: %s hub Session ready; zero-fade quest/hub transition requested",
+                    (attribute & 1) ? "online" : "offline");
             return;
         }
         if (ready != 1) {
@@ -541,7 +627,7 @@ void OnTitleStage(hook::Ctx* c) {
     if (st == 0x11) {
         g_titleContinued = true;
         LogLine("title-fp: native %s-entry state reached", g_cfg.title_only_hub ? "hub" : "quest");
-        FlushStartupProfile();
+        if (!g_postEntryHooksInstalled[3]) FlushStartupProfile();
     }
     return;
 }
@@ -662,7 +748,7 @@ bool InstallHookOnce(HMODULE exe) {
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     const uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
 
-    if (!hook::InitArena(base, end, 0x1000)) {
+    if (!hook::InitArena(base, end, 0x2000)) {
         LogLine("hook: could not allocate an executable arena near the module");
         return false;
     }
@@ -760,6 +846,10 @@ bool InstallHookOnce(HMODULE exe) {
                 g_creditsGateInstalled[1] ? 1u:0u,g_trimCreditsPrefetch ? 1u:0u);
     }
     InstallStartupFontHooks();
+    InstallSaveFastHooks();
+    InstallDx11FastHooks();
+    InstallDx12FastHooks();
+    InstallPostEntryProfileHooks();
     return g_logoExecuteHookInstalled && g_logoHookInstalled && g_titleHookInstalled;
 }
 

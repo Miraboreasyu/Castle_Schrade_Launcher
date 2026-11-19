@@ -8,7 +8,9 @@
 *.log
 *.png
 *.zip
+*.bak
 __pycache__/
+backups/
 build/
 dist/
 .vs/

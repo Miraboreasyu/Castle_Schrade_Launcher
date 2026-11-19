@@ -80,15 +80,150 @@ void CheckFontScope() {
  for (auto& n:g_fontWarmCharacters) n=0;
  puts("PASS: font warm deferral limited to first startup refresh, with complete native forwarding otherwise.");
 }
+unsigned fontCtorNativeCalls = 0;
+void TestFontCtorNative(uintptr_t gui, uint32_t language) {
+ assert(gui == 88 && (language == 8 || language == 0));
+ ++fontCtorNativeCalls;
+ unsigned char chars[0xB0]{}; Wr32((uintptr_t)chars + 0xAC, 50);
+ hook::Ctx c{}; c.rcx=11; c.rdx=(uintptr_t)chars; c.r8=33; c.r9=32;
+ HandleFontWarm(&c, 0, &TestFontWarmNative, 48, 66);
+ HandleFontWarm(&c, 1, &TestFontWarmNative, 48, 66);
+}
+void CheckFontCtorAndDuplicateSkip() {
+ g_cfg={}; g_startupLogoDone=false; g_titleContinued=false;
+ g_fontStartupWindow=true; g_fontRefreshUsed=false;
+ g_fontCtorHookInstalled=true; g_fontCtorRefreshUsed=false; g_fontCtorBoundLang=~0u;
+ for (auto& installed : g_fontHooks) installed=true;
+ fontTestForwarded=0; fontCtorNativeCalls=0;
+ for (auto& n : g_fontWarmCalls) n=0;
+ for (auto& n : g_fontWarmCharacters) n=0;
+ hook::Ctx c{}; c.rcx=88; c.rdx=8;
+ HandleFontRefreshCtor(&c, &TestFontCtorNative);
+ assert(fontCtorNativeCalls==1 && fontTestForwarded==0 && g_fontCtorRefreshUsed && g_fontCtorBoundLang==8);
+ // Same language at aLogo 0x16 skips redundant cache wipe and font reload.
+ HandleFontRefresh(&c, &TestFontCtorNative);
+ assert(fontCtorNativeCalls==1 && g_fontRefreshUsed);
+ // Different language at aLogo 0x16 still runs native font binding with prewarm deferred.
+ g_fontRefreshUsed=false; c.rdx=0;
+ HandleFontRefresh(&c, &TestFontCtorNative);
+ assert(fontCtorNativeCalls==2 && fontTestForwarded==0 && g_fontRefreshUsed);
+ g_fontCtorHookInstalled=false; g_fontCtorRefreshUsed=false; g_fontCtorBoundLang=~0u;
+ g_fontRefreshUsed=false; g_fontStartupWindow=false;
+ for (auto& installed : g_fontHooks) installed=false;
+ for (auto& n : g_fontWarmCalls) n=0;
+ for (auto& n : g_fontWarmCharacters) n=0;
+ fontTestForwarded=0;
+ puts("PASS: ctor font deferral (0x1AEE62D), same-language skip, and changed-language deferred refresh.");
+}
+unsigned contentNativeCalls = 0;
+void TestContentNative(uintptr_t content) { ++contentNativeCalls; Wr32(content + 0x50, 0x14); }
+void CheckSaveFastAndContentSkip() {
+ unsigned char logo[0x120]{};
+ const auto lg = (uintptr_t)logo;
+ g_cfg={}; g_startupLogoDone=false; g_titleContinued=false; g_silentOp1Applied=false;
+ Wr32(lg + 0xA8 + 8, 1); Wr32(lg + 0xA8 + 0x28, 0); Wr32(lg + 0xA8 + 0xC, 0);
+ assert(!TryApplySilentLogoSaveLoad(lg, 4) && Rd32(lg + 0xA8 + 0xC) == 0);
+ g_cfg.title_screen_only = true;
+ assert(!TryApplySilentLogoSaveLoad(lg, 5) && Rd32(lg + 0xA8 + 0xC) == 0);
+ g_cfg.title_screen_only = false;
+ assert(TryApplySilentLogoSaveLoad(lg, 5) && Rd32(lg + 0xA8 + 0xC) == 1);
+ Wr32(lg + 0xA8 + 8, 0); Wr32(lg + 0xA8 + 0xC, 0);
+ assert(!TryApplySilentLogoSaveLoad(lg, 5) && Rd32(lg + 0xA8 + 0xC) == 0);
+
+ auto fakeExe = (unsigned char*)VirtualAlloc(nullptr, 0x51C5000, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+ assert(fakeExe);
+ const uintptr_t savedBase = g_exeBase;
+ g_exeBase = (uintptr_t)fakeExe;
+ std::vector<unsigned char> userBuf(0x22000, 0x33), slotsBuf(kSaveSlotSize * 3, 0x55);
+ const uintptr_t u = (uintptr_t)userBuf.data();
+ WP(g_exeBase + kPSave, u);
+ WP(u + 0xA8, (uintptr_t)slotsBuf.data());
+ g_saveBaseline = ComputeUserDataDigest(u);
+ assert(g_saveBaseline.valid);
+
+ std::vector<unsigned char> contentBuf(0x1200, 0);
+ const uintptr_t content = (uintptr_t)contentBuf.data();
+ hook::Ctx c{}; c.rcx = content;
+ contentNativeCalls = 0;
+ Wr32(content + 0x50, 0x12); Wr32(content + 0xC, 1);
+ HandleContentCheckSave(&c, &TestContentNative);
+ assert(contentNativeCalls == 0 && Rd32(content + 0x50) == 0x17 && Rd32(content + 0xC) == 0);
+
+ slotsBuf[kSaveSlotSize * 2 + 0x100] ^= 0x01;
+ HandleContentCheckSave(&c, &TestContentNative);
+ assert(contentNativeCalls == 1 && Rd32(content + 0x50) == 0x14);
+ slotsBuf[kSaveSlotSize * 2 + 0x100] ^= 0x01;
+
+ contentBuf[0x924] = 1;
+ HandleContentCheckSave(&c, &TestContentNative);
+ assert(contentNativeCalls == 2);
+ contentBuf[0x924] = 0;
+ Wr32(content + 0x112C, 1);
+ HandleContentCheckSave(&c, &TestContentNative);
+ assert(contentNativeCalls == 3);
+
+ g_saveBaseline = {};
+ g_exeBase = savedBase;
+ VirtualFree(fakeExe, 0, MEM_RELEASE);
+ puts("PASS: silent op1 guard and lossless hash-checked content op0 skip (dirty bit / DLC / claims preserved).");
+}
+unsigned loadAllQuestsCalls = 0;
+uint8_t __fastcall FakeLoadAllQuests(uintptr_t quest) {
+ ++loadAllQuestsCalls;
+ Wr32(quest + 0x29EA0, Rd32(quest + 0x29EA0) + 1);
+ return 0;
+}
+unsigned prefetchAddedCount = 0;
+void __fastcall FakeAddResource(uintptr_t, uint32_t, uintptr_t, const char*) { ++prefetchAddedCount; }
+void CheckPlayableOverlapAndDx11Helpers() {
+ std::vector<unsigned char> questBuf(0x2A000, 0);
+ const uintptr_t q = (uintptr_t)questBuf.data();
+ g_playableQuestPrefetched = false; loadAllQuestsCalls = 0;
+ assert(TriggerPlayableQuestPrefetchOnce(q, 0x12345, &FakeLoadAllQuests));
+ assert(loadAllQuestsCalls == 1 && Rd32(q + 0x29EA0) == 1);
+ assert(!TriggerPlayableQuestPrefetchOnce(q, 0x12345, &FakeLoadAllQuests));
+ assert(loadAllQuestsCalls == 1 && Rd32(q + 0x29EA0) == 1);
+ g_playableQuestPrefetched = false;
+
+ std::vector<unsigned char> guiBuf(0x16000, 0);
+ const char* paths[3] = {"ui\\hud\\hud_main", "ui\\credit\\staff", "ui\\opt\\variant"};
+ struct GuiEntry { uintptr_t dti; const char* path; uint32_t flags; uint32_t pad; };
+ GuiEntry entries[3] = {{1, paths[0], 0, 0}, {2, paths[1], 0, 0}, {3, paths[2], 8, 0}};
+ const uintptr_t g = (uintptr_t)guiBuf.data();
+ WP(g + 0x14FB0 + 1 * 0x10, (uintptr_t)entries);
+ Wr32(g + 0x14FB0 + 1 * 0x10 + 8, 3);
+ prefetchAddedCount = 0;
+ assert(AppendRegisteredGuiGroupPaths(0x10000, g, 7, 1, false, &FakeAddResource) == 2);
+ assert(prefetchAddedCount == 2);
+ prefetchAddedCount = 0;
+ assert(AppendRegisteredGuiGroupPaths(0x10000, g, 7, 1, true, &FakeAddResource) == 1);
+ assert(prefetchAddedCount == 1);
+
+ static unsigned psoCalls = 0;
+ auto fakePso = [](uintptr_t) { ++psoCalls; };
+ auto retDx11 = []() -> uint8_t { return 0; };
+ auto retDx12 = []() -> uint8_t { return 1; };
+ hook::Ctx c{}; c.rcx = 0x20000;
+ g_cfg = {}; psoCalls = 0;
+ HandleDx11PsoLoad(&c, retDx11, fakePso); assert(psoCalls == 0);
+ HandleDx11PsoLoad(&c, retDx12, fakePso); assert(psoCalls == 1);
+ g_cfg.title_screen_only = true;
+ HandleDx11PsoLoad(&c, retDx11, fakePso); assert(psoCalls == 2);
+ g_cfg.title_screen_only = false;
+ puts("PASS: LoadAllQuests single-shot invariant, registered GUI group walker, and DX11 PSO guard.");
+}
 int main(){
  CheckFontScope();
+ CheckFontCtorAndDuplicateSkip();
+ CheckSaveFastAndContentSkip();
+ CheckPlayableOverlapAndDx11Helpers();
  CheckResidentSlices();
- // Missing new keys retain the previous complete-auto behavior.
+ // Missing new keys retain the previous complete-auto behavior (and dx11_fast/dx12_fast default to true).
  WriteIni("[auto_quest_start]\nenabled=1\nsave_slot=1\nquest_id=12345\n");
- auto cfg=LoadConfig();assert(cfg.enabled&&!cfg.title_screen_only&&cfg.rehook_on_return&&cfg.save_slot==1&&cfg.quest_id==12345);
- for(int only=0;only<2;++only)for(int rehook=0;rehook<2;++rehook){
-  char ini[240];sprintf_s(ini,"\xEF\xBB\xBF[auto_quest_start]\nenabled=1\ntitle_screen_only=%d\nrehook_on_return=%d\nsave_slot=0\nquest_id=66845\n",only,rehook);
-  WriteIni(ini);cfg=LoadConfig();assert(cfg.title_screen_only==(only!=0)&&cfg.rehook_on_return==(rehook!=0));
+ auto cfg=LoadConfig();assert(cfg.enabled&&!cfg.title_screen_only&&cfg.rehook_on_return&&cfg.save_slot==1&&cfg.quest_id==12345&&cfg.dx11_fast&&cfg.dx12_fast);
+ for(int only=0;only<2;++only)for(int rehook=0;rehook<2;++rehook)for(int d11=0;d11<2;++d11)for(int d12=0;d12<2;++d12){
+  char ini[320];sprintf_s(ini,"\xEF\xBB\xBF[auto_quest_start]\nenabled=1\ntitle_screen_only=%d\nrehook_on_return=%d\nsave_slot=0\nquest_id=66845\ndx11_fast=%d\ndx12_fast=%d\n",only,rehook,d11,d12);
+  WriteIni(ini);cfg=LoadConfig();assert(cfg.title_screen_only==(only!=0)&&cfg.rehook_on_return==(rehook!=0)&&cfg.dx11_fast==(d11!=0)&&cfg.dx12_fast==(d12!=0));
  }
  WriteIni("[auto_quest_start]\nenabled=0\ntitle_screen_only=1\n");assert(!LoadConfig().enabled);
  auto image=(unsigned char*)VirtualAlloc(nullptr,0x51C5000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);assert(image);g_exeBase=(uintptr_t)image;
@@ -138,7 +273,121 @@ int main(){
  assert(!g_sceneRequestHookInstalled&&!g_sceneRequestHookTried&&!g_creditsGatesTried&&!g_trimCreditsPrefetch);
  assert(!memcmp(image+kTitleSceneRequest,kTitleSceneRequestExpected,5)&&!memcmp(image+0x25DD2E,submit,5)&&!memcmp(image+0x25D67E,create,5));
  CheckSites(false,false);
+
+ // Now populate all remaining optional + new hook sites and verify ALL 30 hooks
+ // install cleanly inside the 0x2000-byte hook arena!
+ g_cfg.title_screen_only = false;
+ const unsigned char fontRefresh[] = {0xE8,0xC3,0xF1,0xB1,0x00};
+ const unsigned char fontWarm[]    = {0xE8,0x29,0xE7,0xC1,0x00};
+ const unsigned char fontWarmDf[]  = {0xE8,0x95,0x06,0xA0,0x00};
+ const unsigned char fontCtor[]    = {0xE8,0xCE,0xB1,0xFE,0xFF};
+ const unsigned char contentCall[] = {0xE8,0xF0,0x00,0x00,0x00};
+ const unsigned char psoCall[]     = {0xE8,0x0E,0xFB,0x8B,0x00};
+ const unsigned char shaderCall[]  = {0xE8,0x36,0xD5,0xFF,0xFF};
+ const unsigned char dx12FreeCall[]= {0xE8,0x05,0xE5,0x13,0x00};
+ const unsigned char playableP[]   = {0x40,0x55,0x56,0x41,0x56};
+ const unsigned char villageP[]    = {0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,0xD9};
+ const unsigned char stageP[]      = {0x48,0x89,0x5C,0x24,0x18,0x55,0x57,0x41,0x57};
+ const unsigned char stageInitP[]  = {0x40,0x55,0x41,0x56,0x48,0x8D,0x6C,0x24,0xB1};
+ memcpy(image + 0xFBA638, fontRefresh, 5);
+ memcpy(image + 0x1AD9952, fontWarm, 5);
+ memcpy(image + 0x1AD99F6, fontWarmDf, 5);
+ memcpy(image + 0x1AEE62D, fontCtor, 5);
+ memcpy(image + kUserDataUnpackRva, kUserDataUnpackExpected, sizeof(kUserDataUnpackExpected));
+ memcpy(image + kContentCheckSaveCallRva, contentCall, 5);
+ memcpy(image + kDx11PsoLoadCallRva, psoCall, 5);
+ memcpy(image + kDx11PredAllocRva, kDx11PredAllocExpected, sizeof(kDx11PredAllocExpected));
+ memcpy(image + kDx11PredInitRva, kDx11PredInitExpected, sizeof(kDx11PredInitExpected));
+ memcpy(image + kDx11SetShadersRva, kDx11SetShadersExpected, sizeof(kDx11SetShadersExpected));
+ memcpy(image + kDx11ShaderCleanupRva, kDx11ShaderCleanupExpected, sizeof(kDx11ShaderCleanupExpected));
+ memcpy(image + kDx11ShaderBuildCallRva, shaderCall, 5);
+ memcpy(image + kDx12TexFreeCallRva, dx12FreeCall, 5);
+ memcpy(image + kDx12TexCreateRva, kDx12TexCreateExpected, sizeof(kDx12TexCreateExpected));
+ memcpy(image + kDx12BufReleaseRva, kDx12BufReleaseExpected, sizeof(kDx12BufReleaseExpected));
+ memcpy(image + kDx12IbCreateRva, kDx12BufCreateR13Expected, sizeof(kDx12BufCreateR13Expected));
+ memcpy(image + kDx12VbCreateRva, kDx12BufCreateR13Expected, sizeof(kDx12BufCreateR13Expected));
+ memcpy(image + kDx12SbCreateRva, kDx12BufCreateR12Expected, sizeof(kDx12BufCreateR12Expected));
+ memcpy(image + 0x2505D0, playableP, sizeof(playableP));
+ memcpy(image + 0x24F340, villageP, sizeof(villageP));
+ memcpy(image + 0x24AE70, stageP, sizeof(stageP));
+ memcpy(image + 0x253560, stageInitP, sizeof(stageInitP));
+
+ // Verify dx11_fast=0 and dx12_fast=0 skip installing all DX11/DX12 hooks and leave bytes untouched.
+ g_cfg.dx11_fast = false;
+ g_cfg.dx12_fast = false;
+ InstallDx11FastHooks();
+ InstallDx12FastHooks();
+ assert(!g_dx11PsoHookInstalled && !g_dx11PredAllocHookInstalled && !g_dx11PredInitHookInstalled &&
+        !g_dx11SetShadersHookInstalled && !g_dx11ShaderCleanupHookInstalled && !g_dx11ShaderBuildHookInstalled);
+ assert(!g_dx12TexFreeHookInstalled && !g_dx12TexCreateHookInstalled &&
+        !g_dx12BufReleaseHookInstalled && !g_dx12IbCreateHookInstalled &&
+        !g_dx12VbCreateHookInstalled && !g_dx12SbCreateHookInstalled);
+ assert(!memcmp(image + kDx11PsoLoadCallRva, psoCall, 5));
+ assert(!memcmp(image + kDx12TexCreateRva, kDx12TexCreateExpected, sizeof(kDx12TexCreateExpected)));
+ assert(!memcmp(image + kDx12IbCreateRva, kDx12BufCreateR13Expected, sizeof(kDx12BufCreateR13Expected)));
+ g_dx11FastHooksTried = false;
+ g_dx12FastHooksTried = false;
+ g_cfg.dx11_fast = true;
+ g_cfg.dx12_fast = true;
+
+ assert(InstallHookOnce((HMODULE)image));
+ assert(g_sceneRequestHookInstalled && g_trimCreditsPrefetch);
+ assert(g_fontHooks[0] && g_fontHooks[1] && g_fontHooks[2] && g_fontCtorHookInstalled);
+ assert(g_saveParallelHookInstalled && g_contentSkipHookInstalled);
+ assert(g_dx11PsoHookInstalled && g_dx11PredAllocHookInstalled && g_dx11PredInitHookInstalled);
+ assert(g_dx11SetShadersHookInstalled && g_dx11ShaderCleanupHookInstalled && g_dx11ShaderBuildHookInstalled);
+ assert(g_dx12TexFreeHookInstalled && g_dx12TexCreateHookInstalled);
+ assert(g_dx12BufReleaseHookInstalled && g_dx12IbCreateHookInstalled &&
+        g_dx12VbCreateHookInstalled && g_dx12SbCreateHookInstalled);
+ assert(g_postEntryHooksInstalled[0] && g_postEntryHooksInstalled[1] &&
+        g_postEntryHooksInstalled[2] && g_postEntryHooksInstalled[3]);
+
+ // Unit-test DX12 placed-heap free-list coalescing & handle packing.
+ {
+     std::vector<Dx12FreeSpan> fl{{0, 1024}};
+     uint32_t a = 0, b = 0, cOff = 0;
+     assert(Dx12PlacedTexPool::TakeFromFreeList(fl, 100, a) && a == 0);
+     assert(Dx12PlacedTexPool::TakeFromFreeList(fl, 200, b) && b == 100);
+     assert(Dx12PlacedTexPool::TakeFromFreeList(fl, 50, cOff) && cOff == 300);
+     Dx12PlacedTexPool::InsertAndCoalesce(fl, 0, 100);
+     Dx12PlacedTexPool::InsertAndCoalesce(fl, 300, 50);
+     assert(fl.size() == 2 && fl[0].off == 0 && fl[0].len == 100 && fl[1].off == 300 && fl[1].len == 724);
+     Dx12PlacedTexPool::InsertAndCoalesce(fl, 100, 200);
+     assert(fl.size() == 1 && fl[0].off == 0 && fl[0].len == 1024);
+     const uint64_t h = Dx12PlacedTexPool::PackHandle(7, 300, 64);
+     assert((h & kDx12PlacedTagBit) != 0);
+     assert(((h >> 32) & 0xFFFFu) == 7 && ((h >> 16) & 0xFFFFu) == 300 && (h & 0xFFFFu) == 64);
+ }
+
+ // Unit-test DX11 lazy predicate skip and BuildDx11UsedShaderMask.
+ {
+     std::vector<unsigned char> fakeD3d(0x42000, 0xCC);
+     hook::Ctx pc{};
+     pc.rsi = reinterpret_cast<uintptr_t>(fakeD3d.data());
+     pc.rbx = pc.rsi + 0x1688;
+     pc.r15 = pc.rsi + 0x41688;
+     HandleDx11PredicateInit(&pc);
+     assert(pc.rbx == pc.r15);
+     assert(fakeD3d[0x1688] == 0 && fakeD3d[0x41687] == 0 && fakeD3d[0x1687] == 0xCC);
+
+     unsigned char rShader[0x100]{};
+     unsigned char techs[2 * 0x20]{};
+     std::memset(techs, 0xFF, sizeof(techs));
+     const char* dx11Name = "NormalTech";
+     const char* dx12Name = "SomeTech__d3d12_binary";
+     WP(reinterpret_cast<uintptr_t>(techs), reinterpret_cast<uintptr_t>(dx11Name));
+     *reinterpret_cast<uint16_t*>(techs + 0x10) = 3;
+     WP(reinterpret_cast<uintptr_t>(techs + 0x20), reinterpret_cast<uintptr_t>(dx12Name));
+     *reinterpret_cast<uint16_t*>(techs + 0x20 + 0x10) = 5;
+     Wr32(reinterpret_cast<uintptr_t>(rShader) + 0xF4, 2);
+     WP(reinterpret_cast<uintptr_t>(rShader) + 0xB8, reinterpret_cast<uintptr_t>(techs));
+     std::vector<uint8_t> mask;
+     BuildDx11UsedShaderMask(reinterpret_cast<uintptr_t>(rShader), 8, mask);
+     assert(mask.size() == 8 && mask[3] == 1 && mask[5] == 0 && mask[0] == 0);
+ }
+
  VirtualFree(image,0,MEM_RELEASE);
  puts("PASS: actual INI parsing/defaults, first entry retained, both return policies, soft re-entry, unknown-edit refusal.");
  puts("PASS: title-only timers without resource/selection/quest changes; real optional hooks absent; disabled behavior and mode precedence.");
+ puts("PASS: all 30 startup + post-entry + DX11 lazy + DX12 placed-heap hooks fit cleanly within the 0x2000-byte hook arena.");
 }
