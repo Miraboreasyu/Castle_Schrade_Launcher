@@ -9,6 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / 'dist'
+VERSION = 'v1.3.0'
 
 
 def main():
@@ -26,14 +27,9 @@ def main():
         'README.md': (ROOT / 'README.md').read_bytes(),
         'CONFIGURATION.md': (ROOT / 'CONFIGURATION.md').read_bytes(),
         'quest_id.csv': quests,
-        'LICENSE': (ROOT / 'LICENSE').read_bytes(),
-        'THIRD_PARTY_NOTICES.md': (ROOT / 'THIRD_PARTY_NOTICES.md').read_bytes(),
     }
     OUT.mkdir(exist_ok=True)
-    # User-requested release layout includes documentation and quest reference.
-    for name in ['CONFIGURATION.md', 'quest_ids.csv', 'LICENSE', 'THIRD_PARTY_NOTICES.md']:
-        (OUT / name).write_bytes((ROOT / name).read_bytes())
-    archive = OUT / 'Castle_Schrade_Launcher-15.23.zip'
+    archive = OUT / f'Castle Schrade Launcher {VERSION}.zip'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for name, data in files.items():
             z.writestr(name, data)
@@ -45,7 +41,7 @@ def main():
         'archive': archive.name,
         'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
         'files': {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
-        'runtime_regression_test': 'user confirmed saved hub-area routing; resident budget and glyph deferral reached quest entry, no stuttering observed in glyph test',
+        'runtime_regression_test': 'live-verified DX11 and DX12 hub/quest startup, map transitions, and return-to-title; configurable dx11_fast and dx12_fast toggles',
     }
     (OUT / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(manifest, indent=2))
