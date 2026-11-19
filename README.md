@@ -28,8 +28,8 @@ dx12_fast=1
 |`rehook_on_return`|仅自动任务模式有效：`0` 返回标题后手动选档正常进入据点/集会；`1` 仍重定向到指定任务。返回标题后不会自动选档。|
 |`save_slot`|`0 / 1 / 2` 对应三个存档槽；空槽不会改选其他角色。|
 |`quest_id`|仅自动任务模式有效；`66845` 为传说中的黑龙。查阅包内 `quest_id.csv`。|
-|`dx11_fast`|实验性 DX11 启动加速：`1` 启用后台异步 + 按需编译着色器与延迟创建遮挡查询池；`0` 不安装任何 DX11 加速 hook。|
-|`dx12_fast`|实验性 DX12 加载加速：`1` 启用 64MB Placed Heap 纹理与缓冲区子分配器；`0` 不安装任何 DX12 加速 hook。|
+|`dx11_fast`|实验性 DX11 启动加速：`1` 启用后台异步 + 按需编译着色器与延迟创建遮挡查询池（需提前预加载 `dinput8.dll`，如安装了 SharpPluginLoader / `winmm.dll`）；`0` 不安装任何 DX11 加速 hook。|
+|`dx12_fast`|实验性 DX12 加载加速：`1` 启用 64MB Placed Heap 纹理与缓冲区子分配器（仅装 Stracker's Loader 即可生效）；`0` 不安装任何 DX12 加速 hook。|
 
 ## 三种模式
 
@@ -43,7 +43,7 @@ dx12_fast=1
 
 真实资源加载和 I/O 就绪条件仍保留。自动模式提前请求部分启动资源，并裁剪启动标题场景与制作人员表资源；返回标题时恢复需要的原生资源路径。只到标题模式不启用预加载或裁剪。
 
-自动模式还包含多项启动与进入区域加速：提高首次常驻索引构建预算；在 `sMhMain::ctor` 与 `aLogo` 阶段将批量字形预热改为原生按需生成并跳过同语种重复刷新；三槽存档 Blowfish 并行解密与标题无脏字节冗余重写跳过；在空闲窗口提前并行预取本地化常驻资源与通用 `aPlayable`（任务表与 HUD）资源。此外提供两项可通过 INI 独立开关的实验性图形底层加速：`dx11_fast`（后台异步 + 按需编译着色器、按需创建 `ID3D11Predicate` 查询池、跳过无效 DX12 PSO 缓存读取）与 `dx12_fast`（64MB `ID3D12Heap` Placed Resource 纹理与缓冲区子分配器，大幅减少进入据点与任务的驱动内核分配耗时）。在测试机样本中，从插件就绪到进入月辰集会（`ready -> stage-init`）中位数：DX11 由 18.36s 降至 11.08s，DX12 由 12.73s 降至 11.34s。这些是特定硬件样本对比，不是固定性能保证；若遇驱动兼容或显存异常，可将 `dx11_fast` 或 `dx12_fast` 设为 `0` 回退至原生图形路径。
+自动模式还包含多项启动与进入区域加速：提高首次常驻索引构建预算；在 `sMhMain::ctor` 与 `aLogo` 阶段将批量字形预热改为原生按需生成并跳过同语种重复刷新；三槽存档 Blowfish 并行解密与标题无脏字节冗余重写跳过；在空闲窗口提前并行预取本地化常驻资源与通用 `aPlayable`（任务表与 HUD）资源。此外提供两项可通过 INI 独立开关的实验性图形底层加速：`dx12_fast`（64MB `ID3D12Heap` Placed Resource 纹理与缓冲区子分配器，仅装 Stracker's Loader 即可生效）与 `dx11_fast`（后台异步 + 按需编译着色器与按需创建 `ID3D11Predicate` 查询池；由于游戏在初始化 DX11 之后才动态加载 `dinput8.dll`，`dx11_fast` 需配合进程启动期提前预加载 `dinput8.dll` 的环境——例如安装了 SharpPluginLoader `winmm.dll` 并启用 `PreloadDLLs`——才能拦截启动期着色器构建，仅装 Stracker's Loader 时自动无害跳过）。在测试机样本中，完整插件包环境下进入月辰集会（`ready -> stage-init`）中位数：DX12 由 12.73s 降至 11.34s，DX11（含 SPL 预加载）由 18.36s 降至 11.08s；仅安装 Stracker's Loader + 本插件的纯净环境下 DX12 `ready -> stage-init` 为 8.88–9.62s（从 Steam 启动到月辰集会画面淡入完成约 14.76–15.74s）。这些是特定硬件样本对比，不是固定性能保证；若遇驱动兼容或显存异常，可将 `dx11_fast` 或 `dx12_fast` 设为 `0` 回退至原生图形路径。
 
 不要重命名 DLL 或 INI；不要通过删除 INI 停用插件。日志位于 DLL 旁的 `auto_quest_start.log`，其中 `hub-area` 记录存档开始区域选项。卸载时删除两个插件文件。
 
@@ -66,7 +66,7 @@ The shipped configuration automatically selects save slot 0 and creates a sessio
 
 The release includes `quest_id.csv` as a reference; it does not need to be installed. Do not rename the DLL or INI. IN-Q is optional and independently configured. Full configuration details are in [CONFIGURATION.md](CONFIGURATION.md).
 
-Automatic modes also accelerate resident-index construction, defer exhaustive glyph prewarming in both `sMhMain::ctor` and `aLogo` (skipping duplicate same-language refreshes), parallelize 3-slot Blowfish save decryption while skipping redundant bit-identical title re-saves, and overlap localized-resident plus universal `aPlayable` (quest table + HUD) prefetches during idle startup windows. Two experimental graphics-API toggles are also included (`dx11_fast` for background/on-demand DX11 shader compilation and lazy `ID3D11Predicate` creation; `dx12_fast` for 64 MB `ID3D12Heap` placed-resource texture and buffer sub-allocators); set either to `0` to skip installing its hooks entirely. In benchmark samples on the test machine, `ready -> stage-init` into Seliana Gathering Hub dropped from 18.36s to 11.08s on DX11 and from 12.73s to 11.34s on DX12 (results vary by hardware). All optimizations are disabled in title-screen-only mode.
+Automatic modes also accelerate resident-index construction, defer exhaustive glyph prewarming in both `sMhMain::ctor` and `aLogo` (skipping duplicate same-language refreshes), parallelize 3-slot Blowfish save decryption while skipping redundant bit-identical title re-saves, and overlap localized-resident plus universal `aPlayable` (quest table + HUD) prefetches during idle startup windows. Two experimental graphics-API toggles are also included (`dx12_fast` for 64 MB `ID3D12Heap` placed-resource texture and buffer sub-allocators; `dx11_fast` for background/on-demand DX11 shader compilation and lazy `ID3D11Predicate` creation); set either to `0` to skip installing its hooks entirely. Note that MHW initializes DX11 *before* dynamically loading `dinput8.dll`: `dx12_fast` and all shared startup optimizations work with Stracker's Loader alone (`ready -> stage-init` 8.88–9.62s / 14.76–15.74s Steam-launch-to-Hub in clean-install DX12 samples; 11.34s with a full modpack), whereas `dx11_fast`'s pre-logo shader/predicate hooks only intercept early DX11 init when `dinput8.dll` is preloaded at process start (e.g., alongside SharpPluginLoader `winmm.dll` with `PreloadDLLs`, where `ready -> stage-init` dropped from 18.36s to 11.08s; otherwise it is a harmless no-op). Results vary by hardware, and all optimizations are disabled in title-screen-only mode.
 
 ## 构建与打包 / Build
 

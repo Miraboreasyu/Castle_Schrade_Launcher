@@ -98,7 +98,8 @@ quest_id=66845
 ### dx11_fast 与 dx12_fast：实验性图形 API 加速开关
 
 - `dx11_fast=1`（默认）：在 DX11 模式下启用实验性启动加速（后台异步 + 按需编译着色器、按需创建 `ID3D11Predicate` 查询池、跳过无效 DX12 PSO 缓存读取）。设为 `0` 时不安装任何 DX11 加速 hook。
-- `dx12_fast=1`（默认）：在 DX12 模式下启用实验性加载加速（使用 64MB `ID3D12Heap` Placed Resource 池化分配默认堆纹理与缓冲区，减少驱动内核分配开销）。设为 `0` 时不安装任何 DX12 加速 hook。
+  - **加载时机说明**：MHW 在完成 DX11 设备与启动期着色器初始化之后才动态加载 `dinput8.dll`。若仅安装 Stracker's Loader，`dx11_fast` 会在着色器已构建完毕后安装（自动无害跳过，无副作用）；若同时安装了会在进程启动期提前预加载 `dinput8.dll` 的加载器（如 SharpPluginLoader `winmm.dll` 并配置 `"PreloadDLLs": ["dinput8.dll"]`），则可完整拦截并加速 DX11 启动期着色器与查询池创建。
+- `dx12_fast=1`（默认）：在 DX12 模式下启用实验性加载加速（使用 64MB `ID3D12Heap` Placed Resource 池化分配默认堆纹理与缓冲区，减少驱动内核分配开销）。仅安装 Stracker's Loader 即可完整生效；设为 `0` 时不安装任何 DX12 加速 hook。
 
 由于这两项图形底层优化处于早期阶段，如遇驱动兼容或画面/显存异常，可单独设为 `0` 并重启游戏以回退至原版图形资源路径。`title_screen_only=1` 时两者均不启用。
 
@@ -191,7 +192,8 @@ Choose a quest that your character can normally accept. A numeric ID passing val
 ### dx11_fast and dx12_fast — Experimental graphics API accelerations
 
 - `dx11_fast=1` (default): Enables experimental DX11 startup acceleration (background + on-demand shader compilation, lazy `ID3D11Predicate` pool, and skipping unused DX12 PSO cache loads). Setting `0` skips installing all DX11 acceleration hooks.
-- `dx12_fast=1` (default): Enables experimental DX12 loading acceleration (64 MB `ID3D12Heap` placed-resource sub-allocators for default-heap textures and buffers). Setting `0` skips installing all DX12 acceleration hooks.
+  - **Load-order note**: MHW initializes DX11 and compiles `ShaderPackage` *before* dynamically calling `LoadLibrary("dinput8.dll")`. With Stracker's Loader (`dinput8.dll`) alone, `dx11_fast` arrives after early DX11 shader compilation has already finished (acting as a harmless no-op). When `dinput8.dll` is preloaded at process start (for example, when SharpPluginLoader `winmm.dll` is installed with `"PreloadDLLs": ["dinput8.dll"]`), `dx11_fast` intercepts early DX11 init in time.
+- `dx12_fast=1` (default): Enables experimental DX12 loading acceleration (64 MB `ID3D12Heap` placed-resource sub-allocators for default-heap textures and buffers). Works out of the box with Stracker's Loader alone; setting `0` skips installing all DX12 acceleration hooks.
 
 Because these low-level graphics optimizations are experimental, set either option to `0` and restart the game if you encounter any driver compatibility, rendering, or VRAM issues. Neither option is active when `title_screen_only=1`.
 

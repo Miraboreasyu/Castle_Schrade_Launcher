@@ -48,3 +48,11 @@
 | Steam 启动到画面淡入完成 | `21.04 s` | `21.78 s` | `20.27 s` (min `19.40 s`) |
 
 用户实机验证 DX12 与 DX11 进入游戏、切图及返回标题均正常。
+
+## 5. 纯净环境实测（仅 Stracker's Loader + 本插件，6/6 通过）
+
+将其余 65 个插件/资源目录与 `winmm.dll`（SharpPluginLoader）临时移出后实测：
+
+- **独立稳定性**：无需 `!CRCBypass.dll` 或任何其他辅助插件，DX12 与 DX11 在集会（×2）与虚黑城任务（×1）共 6 次测试及淡入后 5 秒驻留全部零崩溃、零警告通过。
+- **纯净 DX12 性能**：去除其他 18 个插件与 .NET 8 运行时后，`preLogo` 从 `~3.1s` 降至 **`~0.9s`**，月辰集会 `ready -> stage-init` 为 **`8,875–10,359 ms`**（中位数 `9,617 ms`），从点击 Steam 启动到画面淡入完成最快 **`14.76 s`**（中位数 `15.74 s`）；虚黑城任务 `ready -> stage-init` 为 **`10,984 ms`**（扣除原生 `2.0s` 等待为 `8.98 s`），全流程 **`17.30 s`**。`dx12_fast` 放置 3,417 个纹理与 1,129 个缓冲区（缓冲区 0 回退）。
+- **`dinput8.dll` 加载时机与 `dx11_fast`**：`MonsterHunterWorld.exe` 静态导入 `winmm.dll`（因此安装了 SharpPluginLoader 且启用 `PreloadDLLs: ["dinput8.dll"]` 时会在 `WinMain` 前预加载 `dinput8.dll`，使 `dx11_fast` 拦截 `initForD3D11` 与 `ShaderPackage`），而游戏原生是在手柄初始化（晚于 DX11 设备与着色器创建、早于 `sMhMain::ctor` 字体刷新）时才动态 `LoadLibrary("dinput8.dll")`。因此仅装 Stracker's Loader 时，`dx12_fast` 与全部共享启动优化仍 100% 生效，而 `dx11_fast` 会在着色器已编译完毕后无害安装（纯净 DX11 `ready -> stage-init` 仍为 `8,500–8,625 ms`，全流程 `18.18–19.48 s`）。已在 `README.md`、`CONFIGURATION.md`、`auto_quest_start.ini` 与 Release 说明中明确标注。
