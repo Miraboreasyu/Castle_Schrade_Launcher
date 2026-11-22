@@ -51,6 +51,18 @@ constexpr unsigned char kLogoStartExpected[] = {
     0x57,                         // push rdi
     0x48, 0x83, 0xEC, 0x20,       // sub rsp,20
 };
+constexpr uintptr_t kGuiTitlePlayRva = 0x1EFFDF0; // uGUITitle::play (hooked by SharpPluginLoader D3DModule)
+constexpr uintptr_t kGuiTitlePlayRetGateOffset = 0x0F;
+constexpr unsigned char kGuiTitlePlayHeadExpected[15] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+0x08], rbx
+    0x48, 0x89, 0x6C, 0x24, 0x10, // mov [rsp+0x10], rbp
+    0x48, 0x89, 0x74, 0x24, 0x18, // mov [rsp+0x18], rsi
+};
+constexpr unsigned char kGuiTitlePlayTailExpected[14] = {
+    0x48, 0x89, 0x7C, 0x24, 0x20,             // mov [rsp+0x20], rdi
+    0x41, 0x56,                               // push r14
+    0x48, 0x81, 0xEC, 0x40, 0x02, 0x00, 0x00, // sub rsp, 0x240
+};
 
 struct Config {
     bool enabled = true;
@@ -73,6 +85,7 @@ bool g_titleContinued = false;
 uint64_t g_titleFirstSeen = 0;
 bool g_returnTitlePolicyApplied = false;
 bool g_returnTitleRestoreWarning = false;
+bool g_guiTitlePlayHookChecked = false;
 
 void LogLine(const char* fmt, ...) {
     char path[MAX_PATH]{};
@@ -320,6 +333,64 @@ void CheckDx12FallbackCleanup() {
     }
 }
 
+bool TryNotifyHookedGuiTitlePlay(uintptr_t fnAddr, uintptr_t guiTitle) {
+    if (!fnAddr || !guiTitle ||
+        !Readable(fnAddr, kGuiTitlePlayRetGateOffset + sizeof(kGuiTitlePlayTailExpected))) {
+        return false;
+    }
+    const auto* head = reinterpret_cast<const unsigned char*>(fnAddr);
+    if (std::memcmp(head, kGuiTitlePlayHeadExpected, sizeof(kGuiTitlePlayHeadExpected)) == 0) {
+        return false;
+    }
+    const bool isJumpHook = (head[0] == 0xE9) ||
+        (head[0] == 0xFF && head[1] == 0x25) ||
+        (head[0] == 0x48 && head[1] == 0xB8 && head[10] == 0xFF && head[11] == 0xE0);
+    if (!isJumpHook) {
+        return false;
+    }
+    auto* retGate = reinterpret_cast<unsigned char*>(fnAddr + kGuiTitlePlayRetGateOffset);
+    if (std::memcmp(retGate, kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected)) != 0) {
+        return false;
+    }
+
+    constexpr unsigned char kRetGatePatch[5] = {0xC3, 0x90, 0x90, 0x90, 0x90};
+    DWORD oldProt = 0;
+    if (!VirtualProtect(retGate, sizeof(kRetGatePatch), PAGE_EXECUTE_READWRITE, &oldProt)) {
+        return false;
+    }
+    std::memcpy(retGate, kRetGatePatch, sizeof(kRetGatePatch));
+    DWORD ignored = 0;
+    VirtualProtect(retGate, sizeof(kRetGatePatch), oldProt, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), retGate, sizeof(kRetGatePatch));
+
+    reinterpret_cast<void (__fastcall*)(uintptr_t)>(fnAddr)(guiTitle);
+
+    DWORD oldProt2 = 0;
+    if (VirtualProtect(retGate, sizeof(kRetGatePatch), PAGE_EXECUTE_READWRITE, &oldProt2)) {
+        std::memcpy(retGate, kGuiTitlePlayTailExpected, sizeof(kRetGatePatch));
+        VirtualProtect(retGate, sizeof(kRetGatePatch), oldProt2, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), retGate, sizeof(kRetGatePatch));
+    }
+    return true;
+}
+
+void NotifyHookedGuiTitlePlayOnce(uintptr_t title) {
+    if (g_guiTitlePlayHookChecked || !g_cfg.enabled || g_cfg.title_screen_only || !title) {
+        return;
+    }
+    g_guiTitlePlayHookChecked = true;
+    const uintptr_t guiTitle = Readable(title + 0xD8, sizeof(uintptr_t)) ? P(title + 0xD8) : 0;
+    if (!guiTitle || !Readable(guiTitle + 0x0C, 4) || (Rd32(guiTitle + 0x0C) & 0xE) == 0) {
+        LogLine("spl-compat: uGUITitle not ready (%p); skipped hook notify",
+                reinterpret_cast<void*>(guiTitle));
+        return;
+    }
+    if (TryNotifyHookedGuiTitlePlay(g_exeBase + kGuiTitlePlayRva, guiTitle)) {
+        LogLine("spl-compat: notified external GUITitle:Play hook (uGUITitle=%p)",
+                reinterpret_cast<void*>(guiTitle));
+    }
+}
+
 void OnLogoExecute(hook::Ctx* c) {
     if (!g_cfg.enabled || g_startupLogoDone) return;
     const uintptr_t logo = static_cast<uintptr_t>(c->rcx);
@@ -502,6 +573,7 @@ void OnTitleStage(hook::Ctx* c) {
         const bool occupied = record && Readable(record + 0x38, 1) &&
             (*reinterpret_cast<volatile uint8_t*>(record + 0x38) & 1) != 0;
         if (occupied) {
+            NotifyHookedGuiTitlePlayOnce(t);
             reinterpret_cast<void (*)(uintptr_t, uint32_t)>(
                 g_exeBase + 0x1B8F190)(user, slot);
             Wr32(t + 0x7C, 2);

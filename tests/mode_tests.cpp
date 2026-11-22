@@ -17,6 +17,7 @@ void CheckSites(bool redirect,bool dlcPatched){
 void FullReset(bool rehook){
  NativeSites();g_cfg={};g_cfg.quest_id=12345;g_cfg.rehook_on_return=rehook;
  g_titleContinued=false;g_startupLogoDone=true;g_returnTitlePolicyApplied=false;g_returnTitleRestoreWarning=false;
+ g_guiTitlePlayHookChecked=false;
  assert(PatchAll(g_cfg,(HMODULE)g_exeBase));CheckSites(true,true);
 }
 int64_t budgetTestTime = 0, budgetTestCost = 0;
@@ -212,7 +213,148 @@ void CheckPlayableOverlapAndDx11Helpers() {
  g_cfg.title_screen_only = false;
  puts("PASS: LoadAllQuests single-shot invariant, registered GUI group walker, and DX11 PSO guard.");
 }
+
+struct FakeSplHookState {
+ uintptr_t fnAddr = 0;
+ uintptr_t trampAddr = 0;
+ unsigned detourCalls = 0;
+ uintptr_t lastRcx = 0;
+ bool selfUnhook = false;
+};
+FakeSplHookState g_fakeSplHook;
+
+void __fastcall FakeSplDetour(uintptr_t rcx) {
+ ++g_fakeSplHook.detourCalls;
+ g_fakeSplHook.lastRcx = rcx;
+ reinterpret_cast<void (__fastcall*)(uintptr_t)>(g_fakeSplHook.trampAddr)(rcx);
+ if (g_fakeSplHook.selfUnhook) {
+  DWORD oldProt = 0;
+  assert(VirtualProtect(reinterpret_cast<void*>(g_fakeSplHook.fnAddr), 5, PAGE_EXECUTE_READWRITE, &oldProt));
+  std::memcpy(reinterpret_cast<void*>(g_fakeSplHook.fnAddr), kGuiTitlePlayHeadExpected, 5);
+  DWORD ignored = 0;
+  VirtualProtect(reinterpret_cast<void*>(g_fakeSplHook.fnAddr), 5, oldProt, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(g_fakeSplHook.fnAddr), 5);
+ }
+}
+
+void CheckHookedGuiTitlePlayNotify() {
+ auto* buf = static_cast<unsigned char*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+ assert(buf != nullptr);
+ const uintptr_t fn = reinterpret_cast<uintptr_t>(buf);
+ std::memcpy(buf, kGuiTitlePlayHeadExpected, sizeof(kGuiTitlePlayHeadExpected));
+ std::memcpy(buf + kGuiTitlePlayRetGateOffset, kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected));
+ // Place a trap sentinel right after the 29-byte prologue; reaching it crashes/aborts the test.
+ buf[sizeof(kGuiTitlePlayHeadExpected) + sizeof(kGuiTitlePlayTailExpected)] = 0xCC;
+
+ // Subtest A: Unhooked vanilla bytes must return false with 0 detour calls.
+ DWORD oldProt = 0;
+ assert(VirtualProtect(buf, 0x1000, PAGE_EXECUTE_READ, &oldProt));
+ FlushInstructionCache(GetCurrentProcess(), buf, 0x1000);
+ g_fakeSplHook = {};
+ assert(!TryNotifyHookedGuiTitlePlay(fn, 0x12345678ULL));
+ assert(g_fakeSplHook.detourCalls == 0);
+ assert(std::memcmp(buf, kGuiTitlePlayHeadExpected, sizeof(kGuiTitlePlayHeadExpected)) == 0);
+ assert(std::memcmp(buf + kGuiTitlePlayRetGateOffset, kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected)) == 0);
+
+ // Subtest B: 5-byte E9 rel32 self-unhooking hook (exact SharpPluginLoader OnGuiTitlePlay pattern).
+ assert(VirtualProtect(buf, 0x1000, PAGE_EXECUTE_READWRITE, &oldProt));
+ const uintptr_t trampB = reinterpret_cast<uintptr_t>(buf + 0x100);
+ std::memcpy(buf + 0x100, kGuiTitlePlayHeadExpected, 5);
+ buf[0x105] = 0xE9;
+ const int32_t trampBackRel = static_cast<int32_t>(static_cast<int64_t>(fn + 5) - static_cast<int64_t>(trampB + 10));
+ std::memcpy(buf + 0x106, &trampBackRel, 4);
+
+ // x64 thunk at buf + 0x200: mov rax, imm64; jmp rax
+ const uintptr_t thunkB = reinterpret_cast<uintptr_t>(buf + 0x200);
+ const uintptr_t detourAddr = reinterpret_cast<uintptr_t>(&FakeSplDetour);
+ buf[0x200] = 0x48; buf[0x201] = 0xB8;
+ std::memcpy(buf + 0x202, &detourAddr, 8);
+ buf[0x20A] = 0xFF; buf[0x20B] = 0xE0;
+
+ buf[0] = 0xE9;
+ const int32_t hookRel = static_cast<int32_t>(static_cast<int64_t>(thunkB) - static_cast<int64_t>(fn + 5));
+ std::memcpy(buf + 1, &hookRel, 4);
+ g_fakeSplHook = {fn, trampB, 0, 0, true};
+ assert(VirtualProtect(buf, 0x1000, PAGE_EXECUTE_READ, &oldProt));
+ FlushInstructionCache(GetCurrentProcess(), buf, 0x1000);
+
+ assert(TryNotifyHookedGuiTitlePlay(fn, 0x12345678ULL));
+ assert(g_fakeSplHook.detourCalls == 1 && g_fakeSplHook.lastRcx == 0x12345678ULL);
+ assert(std::memcmp(buf, kGuiTitlePlayHeadExpected, sizeof(kGuiTitlePlayHeadExpected)) == 0);
+ assert(std::memcmp(buf + kGuiTitlePlayRetGateOffset, kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected)) == 0);
+
+ // Subtest C: 14-byte FF 25 00 00 00 00 <8-byte addr> indirect-jump hook + NOP pad.
+ assert(VirtualProtect(buf, 0x1000, PAGE_EXECUTE_READWRITE, &oldProt));
+ const uintptr_t trampC = reinterpret_cast<uintptr_t>(buf + 0x300);
+ std::memcpy(buf + 0x300, kGuiTitlePlayHeadExpected, 15);
+ buf[0x30F] = 0xE9;
+ const int32_t trampCBackRel = static_cast<int32_t>(static_cast<int64_t>(fn + 15) - static_cast<int64_t>(trampC + 20));
+ std::memcpy(buf + 0x310, &trampCBackRel, 4);
+
+ buf[0] = 0xFF; buf[1] = 0x25;
+ std::memset(buf + 2, 0, 4);
+ std::memcpy(buf + 6, &detourAddr, 8);
+ buf[14] = 0x90;
+ g_fakeSplHook = {fn, trampC, 0, 0, false};
+ assert(VirtualProtect(buf, 0x1000, PAGE_EXECUTE_READ, &oldProt));
+ FlushInstructionCache(GetCurrentProcess(), buf, 0x1000);
+
+ assert(TryNotifyHookedGuiTitlePlay(fn, 0xABCDEF01ULL));
+ assert(g_fakeSplHook.detourCalls == 1 && g_fakeSplHook.lastRcx == 0xABCDEF01ULL);
+ assert(std::memcmp(buf + kGuiTitlePlayRetGateOffset, kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected)) == 0);
+
+ // Subtest D: NotifyHookedGuiTitlePlayOnce wrapper guards.
+ auto fakeImage = static_cast<unsigned char*>(VirtualAlloc(nullptr, kGuiTitlePlayRva + 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+ assert(fakeImage != nullptr);
+ const uintptr_t savedBase = g_exeBase;
+ g_exeBase = reinterpret_cast<uintptr_t>(fakeImage);
+ const uintptr_t imgFn = g_exeBase + kGuiTitlePlayRva;
+ std::memcpy(reinterpret_cast<void*>(imgFn), kGuiTitlePlayHeadExpected, sizeof(kGuiTitlePlayHeadExpected));
+ std::memcpy(reinterpret_cast<void*>(imgFn + kGuiTitlePlayRetGateOffset), kGuiTitlePlayTailExpected, sizeof(kGuiTitlePlayTailExpected));
+ fakeImage[kGuiTitlePlayRva + sizeof(kGuiTitlePlayHeadExpected) + sizeof(kGuiTitlePlayTailExpected)] = 0xCC;
+
+ // 15-byte trampoline inside fakeImage + 0x400 (within +-2GB rel32 range)
+ const uintptr_t trampD = g_exeBase + kGuiTitlePlayRva + 0x400;
+ std::memcpy(reinterpret_cast<void*>(trampD), kGuiTitlePlayHeadExpected, 15);
+ *reinterpret_cast<unsigned char*>(trampD + 15) = 0xE9;
+ const int32_t trampDBackRel = static_cast<int32_t>(static_cast<int64_t>(imgFn + 15) - static_cast<int64_t>(trampD + 20));
+ std::memcpy(reinterpret_cast<void*>(trampD + 16), &trampDBackRel, 4);
+
+ *reinterpret_cast<unsigned char*>(imgFn) = 0xFF;
+ *reinterpret_cast<unsigned char*>(imgFn + 1) = 0x25;
+ std::memset(reinterpret_cast<void*>(imgFn + 2), 0, 4);
+ std::memcpy(reinterpret_cast<void*>(imgFn + 6), &detourAddr, 8);
+ *reinterpret_cast<unsigned char*>(imgFn + 14) = 0x90;
+ FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(imgFn), 0x500);
+
+ unsigned char fakeTitle[0x100]{}, fakeGui[0x40]{};
+ WP(reinterpret_cast<uintptr_t>(fakeTitle) + 0xD8, reinterpret_cast<uintptr_t>(fakeGui));
+ Wr32(reinterpret_cast<uintptr_t>(fakeGui) + 0x0C, 2);
+
+ g_cfg = {};
+ g_cfg.enabled = true;
+ g_cfg.title_screen_only = true;
+ g_guiTitlePlayHookChecked = false;
+ g_fakeSplHook = {imgFn, trampD, 0, 0, false};
+ NotifyHookedGuiTitlePlayOnce(reinterpret_cast<uintptr_t>(fakeTitle));
+ assert(!g_guiTitlePlayHookChecked && g_fakeSplHook.detourCalls == 0);
+
+ g_cfg.title_screen_only = false;
+ NotifyHookedGuiTitlePlayOnce(reinterpret_cast<uintptr_t>(fakeTitle));
+ assert(g_guiTitlePlayHookChecked && g_fakeSplHook.detourCalls == 1 &&
+        g_fakeSplHook.lastRcx == reinterpret_cast<uintptr_t>(fakeGui));
+ NotifyHookedGuiTitlePlayOnce(reinterpret_cast<uintptr_t>(fakeTitle));
+ assert(g_fakeSplHook.detourCalls == 1);
+
+ g_guiTitlePlayHookChecked = false;
+ g_exeBase = savedBase;
+ VirtualFree(fakeImage, 0, MEM_RELEASE);
+ VirtualFree(buf, 0, MEM_RELEASE);
+ puts("PASS: hooked GUITitle:Play notification (5-byte E9 self-unhook, 14-byte FF25, unhooked skip, wrapper guards).");
+}
+
 int main(){
+ CheckHookedGuiTitlePlayNotify();
  CheckFontScope();
  CheckFontCtorAndDuplicateSkip();
  CheckSaveFastAndContentSkip();
