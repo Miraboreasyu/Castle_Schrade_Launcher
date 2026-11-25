@@ -51,7 +51,7 @@ dx12_fast=1
 
 启动加速、资源裁剪、模式开关与按存档开始区域进入集会已经用户游戏内验证。构建与模式夹具检查补充覆盖配置、补丁边界和返回标题恢复；不表示所有任务和剧情进度组合均已验证。请选用角色可以正常承接的任务。
 
-使用特定版本的内存 hook，不修改磁盘上的游戏程序或直接编辑存档。其他游戏版本或修改相同位置的 mod 可能不兼容。兼容 SharpPluginLoader（自动进集会/任务模式下仍可正常初始化 D3D 面板并呼出 UI）。IN-Q 可选，独立配置；本插件不管理装备、道具或猫饭。
+使用特定版本的内存 hook，不修改磁盘上的游戏程序或直接编辑存档。其他游戏版本或修改相同位置的 mod 可能不兼容。兼容 SharpPluginLoader（自动进集会/任务模式下仍可正常初始化 D3D 面板并呼出 UI）；实验性兼容 MHW DLSS / Frame Generation（`dx12_fast` 改用 `ID3D12Device` 虚表挂钩，不改动游戏纹理/缓冲区构造函数字节）。IN-Q 可选，独立配置；本插件不管理装备、道具或猫饭。
 
 ## English
 
@@ -64,7 +64,7 @@ The shipped configuration automatically selects save slot 0 and creates a sessio
 - Both switches `0`: automatic entry into `quest_id`. Only in this mode does `rehook_on_return` control whether later manual save selections redirect to that quest.
 - `enabled=0` disables the entire plugin. `save_slot` is zero-based; empty slots do not fall back to another character.
 
-The release includes `quest_id.csv` as a reference; it does not need to be installed. Do not rename the DLL or INI. Compatible with SharpPluginLoader (its D3D UI overlay initializes normally even when skipping the Title Screen into Hub/Quest). IN-Q is optional and independently configured. Full configuration details are in [CONFIGURATION.md](CONFIGURATION.md).
+The release includes `quest_id.csv` as a reference; it does not need to be installed. Do not rename the DLL or INI. Compatible with SharpPluginLoader (its D3D UI overlay initializes normally even when skipping the Title Screen into Hub/Quest). Experimental compatibility with MHW DLSS / Frame Generation when `dx12_fast=1` (uses an `ID3D12Device` vtable hook without modifying native texture/buffer constructor code bytes). IN-Q is optional and independently configured. Full configuration details are in [CONFIGURATION.md](CONFIGURATION.md).
 
 Automatic modes also accelerate resident-index construction, defer exhaustive glyph prewarming in both `sMhMain::ctor` and `aLogo` (skipping duplicate same-language refreshes), parallelize 3-slot Blowfish save decryption while skipping redundant bit-identical title re-saves, and overlap localized-resident plus universal `aPlayable` (quest table + HUD) prefetches during idle startup windows. Two experimental graphics-API toggles are also included (`dx12_fast` for 64 MB `ID3D12Heap` placed-resource texture and buffer sub-allocators; `dx11_fast` for background/on-demand DX11 shader compilation and lazy `ID3D11Predicate` creation); set either to `0` to skip installing its hooks entirely. Note that MHW initializes DX11 *before* dynamically loading `dinput8.dll`: `dx12_fast` and all shared startup optimizations work with Stracker's Loader alone (`ready -> stage-init` 8.88–9.62s / 14.76–15.74s Steam-launch-to-Hub in clean-install DX12 samples; 11.34s with a full modpack), whereas `dx11_fast`'s pre-logo shader/predicate hooks only intercept early DX11 init when `dinput8.dll` is preloaded at process start (e.g., alongside SharpPluginLoader `winmm.dll` with `PreloadDLLs`, where `ready -> stage-init` dropped from 18.36s to 11.08s; otherwise it is a harmless no-op). Results vary by hardware, and all optimizations are disabled in title-screen-only mode.
 

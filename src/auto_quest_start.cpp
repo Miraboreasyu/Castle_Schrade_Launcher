@@ -2,6 +2,7 @@
 // Version-specific in-memory patches; no IN-Q bridge or loadout customization.
 #include <windows.h>
 #include <d3d12.h>
+#include <intrin.h>
 #include <malloc.h>
 #include <share.h>
 #include <atomic>

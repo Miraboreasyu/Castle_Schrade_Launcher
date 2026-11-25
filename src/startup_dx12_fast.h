@@ -8,34 +8,43 @@
 //
 //   We reuse a single 64 MB ID3D12Heap sub-allocator template for two Tier-1-compatible pools:
 //     1) Texture Pool (D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES):
-//        - Hook 0x1424E8265 (FUN_1424E7A10): sub-allocate DEFAULT-heap non-RT/DS/MSAA textures
+//        - Vtable slot 27 (ID3D12Device::CreateCommittedResource) when _ReturnAddress() is
+//          g_exeBase + 0x24E82B5 (FUN_1424E7A10): sub-allocate DEFAULT-heap non-RT/DS/MSAA textures
 //          <= 32 MB via CreatePlacedResource; store bit-63-tagged handle in param_1[5] so
 //          mpResidencyManager automatically skips individual MakeResident/Evict calls.
-//        - Hook 0x1424E9286 (~Texture12): reclaim tagged handles via 8-frame GPU quarantine.
+//        - Hook 0x1424E9286 (~Texture12): balance global VRAM counter + reclaim via 8-frame GPU quarantine.
 //     2) Buffer Pool (D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS):
-//        - Hook 0x1424E6722 (IB), 0x1424E89A2 (VB), 0x1424E6F9E (SB): sub-allocate DEFAULT-heap
-//          buffers <= 32 MB via CreatePlacedResource; leave param_1[5] == 0 so SRV/UAV/upload
-//          paths remain 100% native, clear residency flag byte [param_1+0x0C] = 0 so
-//          mpResidencyManager skips them, and track ID3D12Resource* -> handle in a side map.
+//        - Vtable slot 27 when _ReturnAddress() is g_exeBase + 0x24E672B (IB), 0x24E89AB (VB), or
+//          0x24E6FA7 (SB): sub-allocate DEFAULT-heap buffers <= 32 MB via CreatePlacedResource; leave
+//          param_1[5] == 0 so SRV/UAV/upload paths remain 100% native, clear residency flag byte
+//          [param_1+0x0C] = 0 so mpResidencyManager skips them, and track ID3D12Resource* in side map.
 //        - Hook 0x14255397F (FUN_1425538E0): reclaim placed buffer handles via 8-frame quarantine.
-
-constexpr uintptr_t kDx12TexCreateRva = 0x24E8265;
-constexpr unsigned char kDx12TexCreateExpected[5] = {0x49, 0x83, 0x7E, 0x20, 0x00};
+//   Note: Hooking ID3D12Device vtable slot 27 instead of inline-patching inside CreateTextureD3D12
+//   or CreateShaderBufferD3D12 leaves all hashed function bodies unmodified for mhw-dlss-update.
 
 constexpr uintptr_t kDx12TexFreeCallRva = 0x24E9286;
 constexpr uintptr_t kDx12TexFreeTargetRva = 0x2627790;
-
-constexpr uintptr_t kDx12IbCreateRva = 0x24E6722;
-constexpr uintptr_t kDx12VbCreateRva = 0x24E89A2;
-constexpr unsigned char kDx12BufCreateR13Expected[9] = {0x49, 0x8B, 0xCD, 0xFF, 0x90, 0xD8, 0x00, 0x00, 0x00};
-
-constexpr uintptr_t kDx12SbCreateRva = 0x24E6F9E;
-constexpr unsigned char kDx12BufCreateR12Expected[9] = {0x49, 0x8B, 0xCC, 0xFF, 0x90, 0xD8, 0x00, 0x00, 0x00};
+constexpr uintptr_t kDx12TexMemStatRva = 0x51CCDC0;
 
 constexpr uintptr_t kDx12BufReleaseRva = 0x255397F;
 constexpr unsigned char kDx12BufReleaseExpected[7] = {0x48, 0x8B, 0x4B, 0x20, 0x48, 0x85, 0xC9};
 
 constexpr uintptr_t kDx12RenderInstanceRva = 0x51C7050;
+constexpr size_t kDx12CreateCommittedSlot = 27;
+
+// Return addresses immediately after `call qword ptr [rax + 0xD8]` inside native constructors.
+constexpr uintptr_t kDx12TexCreateRetRva = 0x24E82B5;
+constexpr uintptr_t kDx12IbCreateRetRva  = 0x24E672B;
+constexpr uintptr_t kDx12VbCreateRetRva  = 0x24E89AB;
+constexpr uintptr_t kDx12SbCreateRetRva  = 0x24E6FA7;
+
+// Lazy-attach factory trigger prologues (outside all mhw-dlss-update code gates).
+constexpr uintptr_t kDx12TexFactoryRva = 0x26237C0;
+constexpr unsigned char kDx12TexFactoryExpected[6] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20};
+constexpr uintptr_t kDx12SbFactoryRva = 0x26235B0;
+constexpr uintptr_t kDx12IbFactoryRva = 0x26232A0;
+constexpr uintptr_t kDx12VbFactoryRva = 0x2623900;
+constexpr unsigned char kDx12BufFactoryExpected[5] = {0x48, 0x89, 0x5C, 0x24, 0x08};
 constexpr uint64_t kDx12PlacedTagBit = 0x8000000000000000ULL;
 constexpr uint32_t kDx12HeapUnitShift = 16; // 64 KB units (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
 constexpr uint32_t kDx12HeapUnitBytes = 1u << kDx12HeapUnitShift;
@@ -128,16 +137,12 @@ struct Dx12PlacedHeapPool {
             quarantine.erase(quarantine.begin(), quarantine.begin() + static_cast<ptrdiff_t>(quarantineHead));
             quarantineHead = 0;
         }
-        uint32_t emptyCount = 0;
         for (auto& h : heaps) {
             if (h.heap != nullptr && h.usedUnits == 0) {
-                ++emptyCount;
-                if (emptyCount > 2) {
-                    toRelease.push_back(h.heap);
-                    h.heap = nullptr;
-                    h.freeList.clear();
-                    heapsReleased.fetch_add(1, std::memory_order_relaxed);
-                }
+                toRelease.push_back(h.heap);
+                h.heap = nullptr;
+                h.freeList.clear();
+                heapsReleased.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -278,103 +283,45 @@ SRWLOCK g_dx12BufMapLock = SRWLOCK_INIT;
 std::unordered_map<ID3D12Resource*, uint64_t> g_dx12PlacedBufMap;
 std::atomic<uint32_t> g_dx12PlacedBufLive{0};
 
+using CreateCommittedResourceFn = HRESULT (STDMETHODCALLTYPE*)(
+    ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+    const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+    REFIID, void**);
+
+SRWLOCK g_dx12VtableLock = SRWLOCK_INIT;
+std::atomic<CreateCommittedResourceFn> g_origDx12CreateCommitted{nullptr};
+void** g_dx12HookedVtableSlot = nullptr;
+std::atomic<bool> g_dx12VtableHooked{false};
+
 bool g_dx12FastHooksTried = false;
-bool g_dx12TexCreateHookInstalled = false;
 bool g_dx12TexFreeHookInstalled = false;
 bool g_dx12BufReleaseHookInstalled = false;
-bool g_dx12IbCreateHookInstalled = false;
-bool g_dx12VbCreateHookInstalled = false;
-bool g_dx12SbCreateHookInstalled = false;
+bool g_dx12TexFactoryHookInstalled = false;
+bool g_dx12IbFactoryHookInstalled = false;
+bool g_dx12VbFactoryHookInstalled = false;
+bool g_dx12SbFactoryHookInstalled = false;
 
 using NativeTexSmallFreeFn = void (__fastcall*)(uintptr_t, uint64_t);
 
 uint64_t ReadDx12FrameCounter() {
+    if (!g_exeBase || !Readable(g_exeBase + kDx12RenderInstanceRva, 8)) return 0;
     const uintptr_t d3d = P(g_exeBase + kDx12RenderInstanceRva);
     if (!d3d || !Readable(d3d + 0x1E8, 8)) return 0;
     return *reinterpret_cast<const uint64_t*>(d3d + 0x1E8);
 }
 
-void OnDx12TexCreate(hook::Ctx* c) {
-    if (!g_cfg.enabled || g_cfg.title_screen_only || !g_cfg.dx12_fast) return;
-    const uintptr_t tex = static_cast<uintptr_t>(c->r14);
-    const uintptr_t bp = static_cast<uintptr_t>(c->rbp);
-    if (!tex || !bp) return;
-    if (*reinterpret_cast<const uintptr_t*>(tex + 0x20) != 0) return;
-
-    const uintptr_t d3d = P(g_exeBase + kDx12RenderInstanceRva);
-    if (!d3d) return;
-    auto* dev = *reinterpret_cast<ID3D12Device* const*>(d3d + 0x18);
-    if (!dev) return;
-
-    const auto* heapProps = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(bp + 0x40);
-    const void* pClearValue = *reinterpret_cast<void* const*>(bp + 0x30);
-    const auto* srcDesc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(bp + 0xA0);
-
-    if (heapProps->Type != D3D12_HEAP_TYPE_DEFAULT ||
-        heapProps->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
-        heapProps->MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN ||
-        pClearValue != nullptr) {
-        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (srcDesc->Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
-        srcDesc->Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
-        srcDesc->Flags != D3D12_RESOURCE_FLAG_NONE ||
-        srcDesc->SampleDesc.Count != 1) {
-        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    D3D12_RESOURCE_DESC desc = *srcDesc;
-    desc.Alignment = 0;
-
-    D3D12_RESOURCE_ALLOCATION_INFO info = dev->GetResourceAllocationInfo(0, 1, &desc);
-    if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX ||
-        info.SizeInBytes > kDx12MaxPlacedBytes ||
-        info.Alignment > kDx12HeapUnitBytes) {
-        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    const uint32_t units = static_cast<uint32_t>((info.SizeInBytes + (kDx12HeapUnitBytes - 1)) >> kDx12HeapUnitShift);
-    const uint64_t curFrame = *reinterpret_cast<const uint64_t*>(d3d + 0x1E8);
-
-    ID3D12Heap* heap = nullptr;
-    uint32_t heapId = 0;
-    uint32_t offUnits = 0;
-    if (!g_dx12TexPool.AllocBlock(dev, units, curFrame, heap, heapId, offUnits)) {
-        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    ID3D12Resource* res = nullptr;
-    const auto initialState = static_cast<D3D12_RESOURCE_STATES>(static_cast<uint32_t>(c->r13));
-    const HRESULT hr = dev->CreatePlacedResource(
-        heap,
-        static_cast<uint64_t>(offUnits) << kDx12HeapUnitShift,
-        &desc,
-        initialState,
-        nullptr,
-        __uuidof(ID3D12Resource),
-        reinterpret_cast<void**>(&res));
-    heap->Release();
-
-    if (FAILED(hr) || !res) {
-        g_dx12TexPool.ReturnBlockImmediate(heapId, offUnits, units);
-        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    *reinterpret_cast<ID3D12Resource**>(tex + 0x20) = res;
-    *reinterpret_cast<uint64_t*>(tex + 0x28) = Dx12PlacedHeapPool::PackHandle(heapId, offUnits, units);
-    *reinterpret_cast<uint32_t*>(tex + 0x10) = static_cast<uint32_t>(info.SizeInBytes);
-    *reinterpret_cast<uint32_t*>(tex + 0x30) = 0;
-    g_dx12TexPool.placedCount.fetch_add(1, std::memory_order_relaxed);
-}
-
 void OnDx12TexFree(hook::Ctx* c) {
     const uint64_t handle = static_cast<uint64_t>(c->rdx);
     if ((handle & kDx12PlacedTagBit) != 0) {
+        const uintptr_t tex = static_cast<uintptr_t>(c->rbx);
+        if (tex && Readable(tex + 0x30, 4)) {
+            const uint32_t tracked = Rd32(tex + 0x30);
+            if (tracked != 0 && g_exeBase && Readable(g_exeBase + kDx12TexMemStatRva, 8)) {
+                ::InterlockedExchangeAdd64(
+                    reinterpret_cast<volatile LONG64*>(g_exeBase + kDx12TexMemStatRva),
+                    -static_cast<LONG64>(tracked));
+            }
+        }
         g_dx12TexPool.QueueFree(handle, ReadDx12FrameCounter());
         return;
     }
@@ -382,22 +329,38 @@ void OnDx12TexFree(hook::Ctx* c) {
         static_cast<uintptr_t>(c->rcx), handle);
 }
 
-void HandleDx12BufCreate(hook::Ctx* c, ID3D12Device* dev) {
-    const uintptr_t bufObj = static_cast<uintptr_t>(c->rbx);
-    const auto* heapProps = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(c->rdx);
-    const auto heapFlags = static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(c->r8));
-    const auto* srcDesc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(c->r9);
-    const auto initialState = static_cast<D3D12_RESOURCE_STATES>(static_cast<uint32_t>(c->rcx));
-    auto** ppRes = reinterpret_cast<ID3D12Resource**>(bufObj + 0x20);
+HRESULT DispatchDx12CreateCommitted(
+    uintptr_t retAddr, ID3D12Device* dev,
+    const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
+    const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource,
+    void** ppvResource, CreateCommittedResourceFn orig) {
+    if (!g_cfg.enabled || g_cfg.title_screen_only || !g_cfg.dx12_fast ||
+        !dev || !pHeapProperties || !pDesc || !ppvResource ||
+        !g_exeBase || retAddr < g_exeBase) {
+        return orig(dev, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                    pOptimizedClearValue, riidResource, ppvResource);
+    }
 
-    if (g_cfg.enabled && !g_cfg.title_screen_only && g_cfg.dx12_fast && dev && bufObj && heapProps && srcDesc &&
-        heapFlags == D3D12_HEAP_FLAG_NONE &&
-        heapProps->Type == D3D12_HEAP_TYPE_DEFAULT &&
-        heapProps->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN &&
-        heapProps->MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN &&
-        srcDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-        srcDesc->Width > 0 && srcDesc->Width <= kDx12MaxPlacedBytes) {
-        D3D12_RESOURCE_DESC desc = *srcDesc;
+    const uintptr_t retRva = retAddr - g_exeBase;
+    if (retRva == kDx12TexCreateRetRva) {
+        if (!g_dx12TexFreeHookInstalled ||
+            riidResource != __uuidof(ID3D12Resource) ||
+            HeapFlags != D3D12_HEAP_FLAG_NONE ||
+            pHeapProperties->Type != D3D12_HEAP_TYPE_DEFAULT ||
+            pHeapProperties->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
+            pHeapProperties->MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN ||
+            pOptimizedClearValue != nullptr ||
+            pDesc->Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+            pDesc->Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+            pDesc->Flags != D3D12_RESOURCE_FLAG_NONE ||
+            pDesc->SampleDesc.Count != 1) {
+            g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
+            return orig(dev, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                        pOptimizedClearValue, riidResource, ppvResource);
+        }
+
+        D3D12_RESOURCE_DESC desc = *pDesc;
         desc.Alignment = 0;
         const D3D12_RESOURCE_ALLOCATION_INFO info = dev->GetResourceAllocationInfo(0, 1, &desc);
         if (info.SizeInBytes > 0 && info.SizeInBytes != UINT64_MAX &&
@@ -407,52 +370,169 @@ void HandleDx12BufCreate(hook::Ctx* c, ID3D12Device* dev) {
             ID3D12Heap* heap = nullptr;
             uint32_t heapId = 0;
             uint32_t offUnits = 0;
-            if (g_dx12BufPool.AllocBlock(dev, units, ReadDx12FrameCounter(), heap, heapId, offUnits)) {
+            if (g_dx12TexPool.AllocBlock(dev, units, ReadDx12FrameCounter(), heap, heapId, offUnits)) {
                 ID3D12Resource* res = nullptr;
                 const HRESULT hr = dev->CreatePlacedResource(
                     heap,
                     static_cast<uint64_t>(offUnits) << kDx12HeapUnitShift,
                     &desc,
-                    initialState,
+                    InitialResourceState,
                     nullptr,
-                    __uuidof(ID3D12Resource),
+                    riidResource,
                     reinterpret_cast<void**>(&res));
                 heap->Release();
                 if (SUCCEEDED(hr) && res) {
-                    const uint64_t handle = Dx12PlacedHeapPool::PackHandle(heapId, offUnits, units);
-                    ::AcquireSRWLockExclusive(&g_dx12BufMapLock);
-                    g_dx12PlacedBufMap[res] = handle;
-                    ::ReleaseSRWLockExclusive(&g_dx12BufMapLock);
-                    g_dx12PlacedBufLive.fetch_add(1, std::memory_order_release);
-
-                    *ppRes = res;
-                    // Clear residency-managed bit so mpResidencyManager skips this placed buffer
-                    // while param_1[5] stays 0 for native SRV/UAV/upload paths.
-                    *reinterpret_cast<uint8_t*>(bufObj + 0x0C) = 0;
-                    g_dx12BufPool.placedCount.fetch_add(1, std::memory_order_relaxed);
-                    c->rax = static_cast<uint64_t>(static_cast<uint32_t>(S_OK));
-                    return;
+                    *ppvResource = res;
+                    const uintptr_t tex = reinterpret_cast<uintptr_t>(ppvResource) - 0x20;
+                    *reinterpret_cast<uint64_t*>(tex + 0x28) =
+                        Dx12PlacedHeapPool::PackHandle(heapId, offUnits, units);
+                    g_dx12TexPool.placedCount.fetch_add(1, std::memory_order_relaxed);
+                    return S_OK;
                 }
-                g_dx12BufPool.ReturnBlockImmediate(heapId, offUnits, units);
+                g_dx12TexPool.ReturnBlockImmediate(heapId, offUnits, units);
             }
         }
-        g_dx12BufPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
-    } else if (dev && heapProps && heapProps->Type == D3D12_HEAP_TYPE_DEFAULT) {
-        g_dx12BufPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
+        g_dx12TexPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
+        return orig(dev, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                    pOptimizedClearValue, riidResource, ppvResource);
     }
 
-    const HRESULT hr = dev->CreateCommittedResource(
-        heapProps, heapFlags, srcDesc, initialState, nullptr,
-        __uuidof(ID3D12Resource), reinterpret_cast<void**>(ppRes));
-    c->rax = static_cast<uint64_t>(static_cast<uint32_t>(hr));
+    if (retRva == kDx12IbCreateRetRva ||
+        retRva == kDx12VbCreateRetRva ||
+        retRva == kDx12SbCreateRetRva) {
+        if (g_dx12BufReleaseHookInstalled &&
+            riidResource == __uuidof(ID3D12Resource) &&
+            HeapFlags == D3D12_HEAP_FLAG_NONE &&
+            pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT &&
+            pHeapProperties->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN &&
+            pHeapProperties->MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN &&
+            pOptimizedClearValue == nullptr &&
+            pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            pDesc->Width > 0 && pDesc->Width <= kDx12MaxPlacedBytes) {
+            D3D12_RESOURCE_DESC desc = *pDesc;
+            desc.Alignment = 0;
+            const D3D12_RESOURCE_ALLOCATION_INFO info = dev->GetResourceAllocationInfo(0, 1, &desc);
+            if (info.SizeInBytes > 0 && info.SizeInBytes != UINT64_MAX &&
+                info.SizeInBytes <= kDx12MaxPlacedBytes &&
+                info.Alignment <= kDx12HeapUnitBytes) {
+                const uint32_t units = static_cast<uint32_t>((info.SizeInBytes + (kDx12HeapUnitBytes - 1)) >> kDx12HeapUnitShift);
+                ID3D12Heap* heap = nullptr;
+                uint32_t heapId = 0;
+                uint32_t offUnits = 0;
+                if (g_dx12BufPool.AllocBlock(dev, units, ReadDx12FrameCounter(), heap, heapId, offUnits)) {
+                    ID3D12Resource* res = nullptr;
+                    const HRESULT hr = dev->CreatePlacedResource(
+                        heap,
+                        static_cast<uint64_t>(offUnits) << kDx12HeapUnitShift,
+                        &desc,
+                        InitialResourceState,
+                        nullptr,
+                        riidResource,
+                        reinterpret_cast<void**>(&res));
+                    heap->Release();
+                    if (SUCCEEDED(hr) && res) {
+                        const uint64_t handle = Dx12PlacedHeapPool::PackHandle(heapId, offUnits, units);
+                        ::AcquireSRWLockExclusive(&g_dx12BufMapLock);
+                        g_dx12PlacedBufMap[res] = handle;
+                        ::ReleaseSRWLockExclusive(&g_dx12BufMapLock);
+                        g_dx12PlacedBufLive.fetch_add(1, std::memory_order_release);
+
+                        *ppvResource = res;
+                        const uintptr_t bufObj = reinterpret_cast<uintptr_t>(ppvResource) - 0x20;
+                        // Clear residency-managed bit so mpResidencyManager skips this placed buffer
+                        // while param_1[5] stays 0 for native SRV/UAV/upload paths.
+                        *reinterpret_cast<uint8_t*>(bufObj + 0x0C) = 0;
+                        g_dx12BufPool.placedCount.fetch_add(1, std::memory_order_relaxed);
+                        return S_OK;
+                    }
+                    g_dx12BufPool.ReturnBlockImmediate(heapId, offUnits, units);
+                }
+            }
+            g_dx12BufPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
+        } else if (pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT) {
+            g_dx12BufPool.fallbackCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return orig(dev, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                    pOptimizedClearValue, riidResource, ppvResource);
+    }
+
+    return orig(dev, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                pOptimizedClearValue, riidResource, ppvResource);
 }
 
-void OnDx12BufCreateR13(hook::Ctx* c) {
-    HandleDx12BufCreate(c, reinterpret_cast<ID3D12Device*>(c->r13));
+HRESULT STDMETHODCALLTYPE HookedDx12CreateCommittedResource(
+    ID3D12Device* self,
+    const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS HeapFlags,
+    const D3D12_RESOURCE_DESC* pDesc,
+    D3D12_RESOURCE_STATES InitialResourceState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+    REFIID riidResource,
+    void** ppvResource) {
+    const CreateCommittedResourceFn orig = g_origDx12CreateCommitted.load(std::memory_order_acquire);
+    if (!orig) return E_FAIL;
+    return DispatchDx12CreateCommitted(
+        reinterpret_cast<uintptr_t>(_ReturnAddress()),
+        self, pHeapProperties, HeapFlags, pDesc,
+        InitialResourceState, pOptimizedClearValue, riidResource, ppvResource, orig);
 }
 
-void OnDx12BufCreateR12(hook::Ctx* c) {
-    HandleDx12BufCreate(c, reinterpret_cast<ID3D12Device*>(c->r12));
+bool TryInstallDx12CreateCommittedHook(ID3D12Device* dev = nullptr) {
+    if (g_dx12VtableHooked.load(std::memory_order_acquire)) return true;
+    if (!dev) {
+        if (!g_exeBase || !Readable(g_exeBase + kDx12RenderInstanceRva, 8)) return false;
+        const uintptr_t d3d = P(g_exeBase + kDx12RenderInstanceRva);
+        if (!d3d || !Readable(d3d + 0x18, 8)) return false;
+        dev = *reinterpret_cast<ID3D12Device* const*>(d3d + 0x18);
+    }
+    if (!dev || !Readable(reinterpret_cast<uintptr_t>(dev), sizeof(void*))) return false;
+    void** vtable = *reinterpret_cast<void***>(dev);
+    if (!vtable || !Readable(reinterpret_cast<uintptr_t>(&vtable[kDx12CreateCommittedSlot]), sizeof(void*))) {
+        return false;
+    }
+
+    ::AcquireSRWLockExclusive(&g_dx12VtableLock);
+    if (g_dx12VtableHooked.load(std::memory_order_relaxed)) {
+        ::ReleaseSRWLockExclusive(&g_dx12VtableLock);
+        return true;
+    }
+    void* cur = vtable[kDx12CreateCommittedSlot];
+    if (!cur) {
+        ::ReleaseSRWLockExclusive(&g_dx12VtableLock);
+        return false;
+    }
+    if (cur == reinterpret_cast<void*>(&HookedDx12CreateCommittedResource)) {
+        g_dx12HookedVtableSlot = &vtable[kDx12CreateCommittedSlot];
+        g_dx12VtableHooked.store(true, std::memory_order_release);
+        ::ReleaseSRWLockExclusive(&g_dx12VtableLock);
+        return true;
+    }
+
+    g_origDx12CreateCommitted.store(reinterpret_cast<CreateCommittedResourceFn>(cur), std::memory_order_release);
+    DWORD oldProt = 0;
+    if (!VirtualProtect(&vtable[kDx12CreateCommittedSlot], sizeof(void*), PAGE_READWRITE, &oldProt)) {
+        g_origDx12CreateCommitted.store(nullptr, std::memory_order_release);
+        ::ReleaseSRWLockExclusive(&g_dx12VtableLock);
+        return false;
+    }
+    InterlockedExchangePointer(&vtable[kDx12CreateCommittedSlot],
+                               reinterpret_cast<void*>(&HookedDx12CreateCommittedResource));
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[kDx12CreateCommittedSlot], sizeof(void*), oldProt, &ignored);
+    g_dx12HookedVtableSlot = &vtable[kDx12CreateCommittedSlot];
+    g_dx12VtableHooked.store(true, std::memory_order_release);
+    ::ReleaseSRWLockExclusive(&g_dx12VtableLock);
+
+    LogLine("dx12-fast: hooked ID3D12Device::CreateCommittedResource vtable slot %zu (dev=%p orig=%p)",
+            kDx12CreateCommittedSlot, dev, cur);
+    return true;
+}
+
+void OnDx12FactoryTrigger(hook::Ctx*) {
+    if (!g_dx12VtableHooked.load(std::memory_order_acquire) &&
+        g_cfg.enabled && !g_cfg.title_screen_only && g_cfg.dx12_fast) {
+        TryInstallDx12CreateCommittedHook();
+    }
 }
 
 void OnDx12BufRelease(hook::Ctx* c) {
@@ -505,28 +585,19 @@ void InstallDx12FastHooks() {
     }
 
     const unsigned char noCall5[5] = {0x90, 0x90, 0x90, 0x90, 0x90};
-    const unsigned char noCall9[9] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 
-    // Texture placed-heap hooks (install destructor free-hook FIRST!).
+    // Texture free-hook (5-byte CALL replacement outside all hashed code gates).
     const uintptr_t freeSite = g_exeBase + kDx12TexFreeCallRva;
     const uintptr_t freeTarget = g_exeBase + kDx12TexFreeTargetRva;
-    const uintptr_t createSite = g_exeBase + kDx12TexCreateRva;
-    if (Readable(freeSite, 5) && *reinterpret_cast<const uint8_t*>(freeSite) == 0xE8 &&
-        Readable(createSite, sizeof(kDx12TexCreateExpected)) &&
-        std::memcmp(reinterpret_cast<const void*>(createSite), kDx12TexCreateExpected, sizeof(kDx12TexCreateExpected)) == 0) {
+    if (Readable(freeSite, 5) && *reinterpret_cast<const uint8_t*>(freeSite) == 0xE8) {
         int32_t rel = 0;
         std::memcpy(&rel, reinterpret_cast<const void*>(freeSite + 1), 4);
         if (static_cast<int64_t>(freeSite + 5) + rel == static_cast<int64_t>(freeTarget)) {
             g_dx12TexFreeHookInstalled = hook::InstallCtxHook(freeSite, 5, &OnDx12TexFree, noCall5, 5);
-            if (g_dx12TexFreeHookInstalled) {
-                g_dx12TexCreateHookInstalled = hook::InstallCtxHook(
-                    createSite, sizeof(kDx12TexCreateExpected), &OnDx12TexCreate,
-                    kDx12TexCreateExpected, sizeof(kDx12TexCreateExpected));
-            }
         }
     }
 
-    // Buffer placed-heap hooks (install release-hook FIRST!).
+    // Buffer release-hook (7 bytes inside ReleaseResourceBaseD3D12, outside all hashed code gates).
     const uintptr_t bufRelSite = g_exeBase + kDx12BufReleaseRva;
     if (Readable(bufRelSite, sizeof(kDx12BufReleaseExpected)) &&
         std::memcmp(reinterpret_cast<const void*>(bufRelSite), kDx12BufReleaseExpected, sizeof(kDx12BufReleaseExpected)) == 0) {
@@ -534,29 +605,49 @@ void InstallDx12FastHooks() {
             bufRelSite, sizeof(kDx12BufReleaseExpected), &OnDx12BufRelease,
             kDx12BufReleaseExpected, sizeof(kDx12BufReleaseExpected));
     }
-    if (g_dx12BufReleaseHookInstalled) {
-        const uintptr_t ibSite = g_exeBase + kDx12IbCreateRva;
-        const uintptr_t vbSite = g_exeBase + kDx12VbCreateRva;
-        const uintptr_t sbSite = g_exeBase + kDx12SbCreateRva;
-        if (Readable(ibSite, sizeof(kDx12BufCreateR13Expected)) &&
-            std::memcmp(reinterpret_cast<const void*>(ibSite), kDx12BufCreateR13Expected, sizeof(kDx12BufCreateR13Expected)) == 0) {
-            g_dx12IbCreateHookInstalled = hook::InstallCtxHook(ibSite, 9, &OnDx12BufCreateR13, noCall9, 9);
+
+    bool vtableImmediate = false;
+    if (g_dx12TexFreeHookInstalled || g_dx12BufReleaseHookInstalled) {
+        vtableImmediate = TryInstallDx12CreateCommittedHook();
+
+        // Install lightweight lazy triggers on the 4 factory wrappers (>4 KB away from any code gate)
+        // in case dinput8.dll was preloaded before cD3DRender::initForD3D12 initialized ID3D12Device.
+        const uintptr_t texFac = g_exeBase + kDx12TexFactoryRva;
+        if (Readable(texFac, sizeof(kDx12TexFactoryExpected)) &&
+            std::memcmp(reinterpret_cast<const void*>(texFac), kDx12TexFactoryExpected, sizeof(kDx12TexFactoryExpected)) == 0) {
+            g_dx12TexFactoryHookInstalled = hook::InstallCtxHook(
+                texFac, sizeof(kDx12TexFactoryExpected), &OnDx12FactoryTrigger,
+                kDx12TexFactoryExpected, sizeof(kDx12TexFactoryExpected));
         }
-        if (Readable(vbSite, sizeof(kDx12BufCreateR13Expected)) &&
-            std::memcmp(reinterpret_cast<const void*>(vbSite), kDx12BufCreateR13Expected, sizeof(kDx12BufCreateR13Expected)) == 0) {
-            g_dx12VbCreateHookInstalled = hook::InstallCtxHook(vbSite, 9, &OnDx12BufCreateR13, noCall9, 9);
+        const uintptr_t ibFac = g_exeBase + kDx12IbFactoryRva;
+        if (Readable(ibFac, sizeof(kDx12BufFactoryExpected)) &&
+            std::memcmp(reinterpret_cast<const void*>(ibFac), kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected)) == 0) {
+            g_dx12IbFactoryHookInstalled = hook::InstallCtxHook(
+                ibFac, sizeof(kDx12BufFactoryExpected), &OnDx12FactoryTrigger,
+                kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected));
         }
-        if (Readable(sbSite, sizeof(kDx12BufCreateR12Expected)) &&
-            std::memcmp(reinterpret_cast<const void*>(sbSite), kDx12BufCreateR12Expected, sizeof(kDx12BufCreateR12Expected)) == 0) {
-            g_dx12SbCreateHookInstalled = hook::InstallCtxHook(sbSite, 9, &OnDx12BufCreateR12, noCall9, 9);
+        const uintptr_t vbFac = g_exeBase + kDx12VbFactoryRva;
+        if (Readable(vbFac, sizeof(kDx12BufFactoryExpected)) &&
+            std::memcmp(reinterpret_cast<const void*>(vbFac), kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected)) == 0) {
+            g_dx12VbFactoryHookInstalled = hook::InstallCtxHook(
+                vbFac, sizeof(kDx12BufFactoryExpected), &OnDx12FactoryTrigger,
+                kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected));
+        }
+        const uintptr_t sbFac = g_exeBase + kDx12SbFactoryRva;
+        if (Readable(sbFac, sizeof(kDx12BufFactoryExpected)) &&
+            std::memcmp(reinterpret_cast<const void*>(sbFac), kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected)) == 0) {
+            g_dx12SbFactoryHookInstalled = hook::InstallCtxHook(
+                sbFac, sizeof(kDx12BufFactoryExpected), &OnDx12FactoryTrigger,
+                kDx12BufFactoryExpected, sizeof(kDx12BufFactoryExpected));
         }
     }
 
-    LogLine("dx12-fast: placed-tex=%u/%u placed-buf=%u/%u/%u/%u",
+    LogLine("dx12-fast: rel-tex=%u rel-buf=%u triggers=%u/%u/%u/%u vtable=%u",
             g_dx12TexFreeHookInstalled ? 1u : 0u,
-            g_dx12TexCreateHookInstalled ? 1u : 0u,
             g_dx12BufReleaseHookInstalled ? 1u : 0u,
-            g_dx12IbCreateHookInstalled ? 1u : 0u,
-            g_dx12VbCreateHookInstalled ? 1u : 0u,
-            g_dx12SbCreateHookInstalled ? 1u : 0u);
+            g_dx12TexFactoryHookInstalled ? 1u : 0u,
+            g_dx12IbFactoryHookInstalled ? 1u : 0u,
+            g_dx12VbFactoryHookInstalled ? 1u : 0u,
+            g_dx12SbFactoryHookInstalled ? 1u : 0u,
+            vtableImmediate ? 1u : 0u);
 }

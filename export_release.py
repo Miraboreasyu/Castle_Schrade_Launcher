@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / 'dist'
-VERSION = 'v1.3.1'
+VERSION = 'v1.3.2'
 
 
 def main():
@@ -41,7 +41,7 @@ def main():
         'archive': archive.name,
         'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
         'files': {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
-        'runtime_regression_test': 'live-verified DX11 and DX12 hub/quest startup, SharpPluginLoader UI (F9) compatibility on direct hub/quest startup, map transitions, and return-to-title; configurable dx11_fast and dx12_fast toggles',
+        'runtime_regression_test': 'live-verified DX11 and DX12 hub/quest startup, SharpPluginLoader UI (F9) compatibility, experimental MHW DLSS / Frame Generation compatibility with dx12_fast=1 (ID3D12Device vtable hook), map transitions, and return-to-title; configurable dx11_fast and dx12_fast toggles',
     }
     (OUT / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(manifest, indent=2))
